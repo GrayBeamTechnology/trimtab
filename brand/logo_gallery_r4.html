@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html><head><title>trimtab — Logo R4 Synthesis</title>
+<style>
+body { background:#111; color:#fbbf24; font-family:monospace; padding:20px; margin:0; }
+h1 { font-size:18px; letter-spacing:4px; text-transform:uppercase; border-bottom:1px solid #333; padding-bottom:8px; }
+.subtitle { color:#888; font-size:13px; margin-top:4px; line-height:1.5; }
+.toolbar { display:flex; gap:12px; align-items:center; margin-top:12px; }
+.toolbar button { background:#1a1a2e; color:#fbbf24; border:1px solid #333; border-radius:6px; padding:6px 16px; font-family:monospace; font-size:13px; cursor:pointer; transition:all 0.15s; }
+.toolbar button:hover { border-color:#fbbf24; }
+.toolbar button:disabled { opacity:0.3; cursor:default; }
+.toolbar .status { font-size:12px; color:#666; }
+h2 { font-size:14px; color:#555; letter-spacing:2px; text-transform:uppercase; margin-top:32px; border-top:1px solid #222; padding-top:16px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:16px; margin-top:16px; }
+.card { background:#1a1a2e; border:2px solid #333; border-radius:8px; overflow:hidden; cursor:pointer; transition:border-color 0.15s, box-shadow 0.15s; }
+.card:hover { border-color:#555; }
+.card.selected { border-color:#fbbf24; box-shadow:0 0 20px rgba(251,191,36,0.15); }
+.card img { width:100%; display:block; }
+.card .label { padding:8px 12px; font-size:14px; color:#fbbf24; display:flex; justify-content:space-between; align-items:center; }
+.card .desc { padding:0 12px 10px; font-size:11px; color:#888; line-height:1.4; }
+.card .type { display:inline-block; font-size:9px; text-transform:uppercase; letter-spacing:1px; padding:2px 6px; border-radius:3px; margin-left:8px; }
+.type-mark { background:#7f1d1d; color:#fca5a5; }
+.type-hero { background:#78350f; color:#fbbf24; }
+.pick-btn { background:transparent; color:#666; border:1px solid #444; border-radius:4px; padding:3px 10px; font-family:monospace; font-size:11px; cursor:pointer; transition:all 0.15s; }
+.pick-btn:hover { color:#fbbf24; border-color:#fbbf24; }
+.card.selected .pick-btn { background:#fbbf24; color:#111; border-color:#fbbf24; }
+.copied { color:#4ade80 !important; }
+.palette { display:flex; gap:8px; margin-top:16px; padding:12px; background:#1a1a2e; border-radius:8px; }
+.swatch { width:48px; height:48px; border-radius:6px; display:flex; align-items:end; justify-content:center; font-size:9px; padding-bottom:4px; }
+</style></head><body>
+<h1>trimtab — R4 Synthesis</h1>
+<p class="subtitle">v10 form + v11 engineering + v12 red &rarr; unified brand system<br>
+Mark = favicon/nav/avatar &nbsp;|&nbsp; Hero = site landing page illustration</p>
+
+<h2>Color Palette</h2>
+<div class="palette">
+  <div class="swatch" style="background:#f59e0b;color:#111">amber</div>
+  <div class="swatch" style="background:#d97706;color:#111">gold</div>
+  <div class="swatch" style="background:#991b1b;color:#fca5a5">red</div>
+  <div class="swatch" style="background:#7f1d1d;color:#fca5a5">dark red</div>
+  <div class="swatch" style="background:#374151;color:#9ca3af">titanium</div>
+  <div class="swatch" style="background:#0a0a0a;color:#555;border:1px solid #333">black</div>
+</div>
+
+<div class="toolbar">
+  <button id="copyBtn" onclick="copySelection()" disabled>Copy selection</button>
+  <span id="status" class="status"></span>
+</div>
+
+<h2>The Mark (Logo / Favicon)</h2>
+<div class="grid">
+  <div class="card" data-name="logo_mark-synthesis_v13.jpg" data-label="v13-mark-synthesis" onclick="selectCard(this)">
+    <img src="logo_mark-synthesis_v13.jpg">
+    <div class="label">v13 — mark synthesis <span class="type type-mark">mark</span><button class="pick-btn" onclick="event.stopPropagation();pickCard(this.closest('.card'))">Select</button></div>
+    <div class="desc">Compact chevron. Titanium shell + heat patina. Gold inner trim tab + star. Red construction arcs behind. Dark bg.</div>
+  </div>
+  <div class="card" data-name="logo_mark-angular_v14.jpg" data-label="v14-mark-angular" onclick="selectCard(this)">
+    <img src="logo_mark-angular_v14.jpg">
+    <div class="label">v14 — mark angular <span class="type type-mark">mark</span><button class="pick-btn" onclick="event.stopPropagation();pickCard(this.closest('.card'))">Select</button></div>
+    <div class="desc">Wide SR-71 sweep. Corrugated titanium + iridescent tips. Bronze-gold center + star. Red construction behind. Light bg.</div>
+  </div>
+</div>
+
+<h2>The Hero (Site Landing Page)</h2>
+<div class="grid">
+  <div class="card" data-name="logo_hero-blueprint_v15.jpg" data-label="v15-hero-blueprint" onclick="selectCard(this)">
+    <img src="logo_hero-blueprint_v15.jpg">
+    <div class="label">v15 — hero blueprint <span class="type type-hero">hero</span><button class="pick-btn" onclick="event.stopPropagation();pickCard(this.closest('.card'))">Select</button></div>
+    <div class="desc">Full delta planform engineering drawing. Red annotations + dimension lines. Heat-scorched titanium. Gold trim tab + star. Cross-section details. "trimtab" wordmark.</div>
+  </div>
+  <div class="card" data-name="logo_hero-dramatic_v16.jpg" data-label="v16-hero-dramatic" onclick="selectCard(this)">
+    <img src="logo_hero-dramatic_v16.jpg">
+    <div class="label">v16 — hero dramatic <span class="type type-hero">hero</span><button class="pick-btn" onclick="event.stopPropagation();pickCard(this.closest('.card'))">Select</button></div>
+    <div class="desc">Nested titanium triangles. Red construction geometry glow. Gold chevron burning at center. Compass star. "trimtab" monospace. Classified Skunk Works feel.</div>
+  </div>
+</div>
+
+<h2>Previous Winners for Reference</h2>
+<div class="grid">
+  <div class="card" data-name="logo_heat-shimmer_v10.jpg" data-label="v10-heat-shimmer" onclick="selectCard(this)">
+    <img src="logo_heat-shimmer_v10.jpg">
+    <div class="label">v10 — heat shimmer (R3)<button class="pick-btn" onclick="event.stopPropagation();pickCard(this.closest('.card'))">Select</button></div>
+    <div class="desc">Original R3 winner. Corrugated titanium + gold center. Basis for mark synthesis.</div>
+  </div>
+  <div class="card" data-name="logo_blueprint-amber_v11.jpg" data-label="v11-blueprint-amber" onclick="selectCard(this)">
+    <img src="logo_blueprint-amber_v11.jpg">
+    <div class="label">v11 — blueprint amber (R3)<button class="pick-btn" onclick="event.stopPropagation();pickCard(this.closest('.card'))">Select</button></div>
+    <div class="desc">Original R3 winner. Full engineering drawing. Basis for hero synthesis.</div>
+  </div>
+  <div class="card" data-name="logo_erlang-red_v12.jpg" data-label="v12-erlang-red" onclick="selectCard(this)">
+    <img src="logo_erlang-red_v12.jpg">
+    <div class="label">v12 — erlang red (R3)<button class="pick-btn" onclick="event.stopPropagation();pickCard(this.closest('.card'))">Select</button></div>
+    <div class="desc">Armstrong tribute. Red accent color sourced from here into R4.</div>
+  </div>
+</div>
+
+<script>
+let selected = null;
+function selectCard(card) {
+  document.querySelectorAll('.card').forEach(c => c.classList.remove('selected'));
+  card.classList.add('selected');
+  selected = card;
+  document.getElementById('copyBtn').disabled = false;
+  document.getElementById('status').textContent = card.dataset.label + ' selected';
+}
+function pickCard(card) {
+  selectCard(card);
+  copySelection();
+}
+function copySelection() {
+  if (!selected) return;
+  const text = selected.dataset.label;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('copyBtn');
+    const status = document.getElementById('status');
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    status.textContent = selected.dataset.label + ' — ' + selected.dataset.name;
+    setTimeout(() => { btn.textContent = 'Copy selection'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+</script>
+</body></html>

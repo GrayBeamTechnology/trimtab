@@ -1,0 +1,578 @@
+---
+/*
+ * ┌─────────────────────────────────────────────────────────┐
+ * │                                                         │
+ * │   "Something hit me very hard once, thinking about      │
+ * │    what one little man could do. Think of the Queen      │
+ * │    Mary — the whole ship goes by and then comes the      │
+ * │    rudder. And there's a tiny thing at the edge of       │
+ * │    the rudder called a trim tab."                        │
+ * │                                                         │
+ * │                    — R. Buckminster Fuller, 1972         │
+ * │                                                         │
+ * └─────────────────────────────────────────────────────────┘
+ *
+ * If you're reading this source, you're our kind of person.
+ *
+ * Three people understood that the world is moved not by
+ * the biggest force, but by the best-placed one:
+ *
+ *   Fuller    — geometry
+ *   Armstrong — fault tolerance
+ *   Knuth     — algorithmic rigor
+ *
+ * This site is 0 lines of client JavaScript.
+ * The trim tab principle, applied to web development.
+ */
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+    ╔══════════════════════════════════════════════════════════╗
+    ║                                                        ║
+    ║   EASTER EGG #1: You found the source.                 ║
+    ║                                                        ║
+    ║   "Premature optimization is the root of all evil."    ║
+    ║                           — Donald Knuth, 1974         ║
+    ║                                                        ║
+    ║   This page has no build step beyond Astro's static    ║
+    ║   generation. No React. No Vue. No Svelte. No JS       ║
+    ║   framework. Just HTML and CSS. The trim tab of web    ║
+    ║   development: the minimum surface that renders the    ║
+    ║   content.                                             ║
+    ║                                                        ║
+    ╚══════════════════════════════════════════════════════════╝
+    -->
+    <link rel="icon" type="image/jpeg" href="/img/mark.jpg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="trimtab — find the small surface that steers the ship. A methodology for human-AI collaboration inspired by Fuller, Armstrong, and Knuth." />
+    <meta property="og:title" content="trimtab" />
+    <meta property="og:description" content="Find the small surface that steers the ship." />
+    <meta property="og:image" content="/img/hero.jpg" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://trimtab.dev" />
+    <title>trimtab — find the small surface that steers the ship</title>
+
+    <!--
+      EASTER EGG #2: The font stack.
+
+      JetBrains Mono because monospace is the native tongue
+      of people who read source code for fun.
+
+      "The question of whether a computer can think is no
+       more interesting than the question of whether a
+       submarine can swim." — Edsger Dijkstra
+
+      (Dijkstra would have been a trimtab person.)
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,600;1,300;1,400&display=swap" rel="stylesheet" />
+
+    <style is:global>
+      /* ═══════════════════════════════════════════════
+         EASTER EGG #3: CSS custom properties.
+
+         The color names tell the story:
+         --trimtab    = the small surface (amber/gold)
+         --erlang     = let it crash (Armstrong's red)
+         --titanium   = the structure (SR-71 skin)
+         --blueprint  = the analysis (Knuth's rigor)
+
+         "The errors which arise from the absence of
+          facts are far more numerous and more durable
+          than those which result from unsound reasoning
+          respecting true data."
+                              — Charles Babbage
+         ═══════════════════════════════════════════════ */
+
+      :root {
+        /* Color palette */
+        --trimtab: #f59e0b;
+        --trimtab-deep: #d97706;
+        --erlang: #991b1b;
+        --erlang-dim: #7f1d1d;
+        --titanium: #374151;
+        --titanium-light: #4b5563;
+        --blueprint: #0a0a0a;
+        --text: #9ca3af;
+        --text-bright: #d1d5db;
+        --text-dim: #6b7280;
+        --surface: #111111;
+        --surface-raised: #1a1a2e;
+
+        /* Golden ratio type scale (φ = 1.618) */
+        --font-xs: 0.618rem;   /* ≈10px - footer, gravestone */
+        --font-sm: 0.786rem;   /* ≈12.5px - section nums, nav links, tool descriptions, thinker principles */
+        --font-base: 1rem;     /* 16px - body text, tool card h3, nav logo */
+        --font-md: 1.272rem;   /* ≈20px - section h2 headings */
+        --font-lg: 1.618rem;   /* ≈26px - hero h1 tagline */
+        --font-xl: 2.618rem;   /* reserved */
+      }
+
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+
+      html {
+        font-family: 'JetBrains Mono', monospace;
+        background: var(--blueprint);
+        color: var(--text);
+        font-size: 16px;
+        line-height: 1.75;
+        scroll-behavior: smooth;
+      }
+
+      body {
+        width: 100%;
+        max-width: 860px;
+        margin: 0 auto;
+        padding: 0 2rem;
+      }
+
+      /* ── NAV ── */
+      nav {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 1.5rem 0;
+        border-bottom: 1px solid var(--titanium);
+      }
+      nav .logo {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        text-decoration: none;
+        color: var(--text-bright);
+        font-weight: 600;
+        font-size: var(--font-base);
+        letter-spacing: 0.15em;
+      }
+      nav .logo img {
+        width: 32px;
+        height: 32px;
+        border-radius: 4px;
+        object-fit: cover;
+      }
+      nav .links {
+        display: flex;
+        gap: 1.5rem;
+        font-size: var(--font-sm);
+      }
+      nav .links a {
+        color: var(--text-dim);
+        text-decoration: none;
+        transition: color 0.15s;
+      }
+      nav .links a:hover {
+        color: var(--trimtab);
+      }
+
+      /* ── HERO ── */
+      .hero {
+        position: relative;
+        margin: 0 -2rem;
+        padding: 4rem 2rem 3rem;
+        text-align: center;
+        background: url('/img/hero.jpg') center center / cover no-repeat;
+        border-bottom: 1px solid var(--titanium);
+      }
+      .hero::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: radial-gradient(ellipse at center, rgba(10,10,10,0.55) 0%, rgba(10,10,10,0.85) 70%, var(--blueprint) 100%);
+      }
+      .hero-content {
+        position: relative;
+        z-index: 1;
+      }
+      .hero .mark {
+        width: 180px;
+        height: 180px;
+        border-radius: 12px;
+        border: 1px solid var(--titanium-light);
+        object-fit: cover;
+        box-shadow: 0 0 60px rgba(245, 158, 11, 0.15);
+      }
+      .hero h1 {
+        font-size: var(--font-lg);
+        font-weight: 300;
+        color: var(--text-dim);
+        margin-top: 1.5rem;
+        font-style: italic;
+        letter-spacing: 0.05em;
+      }
+      .hero h1 em {
+        color: var(--trimtab);
+        font-style: normal;
+        font-weight: 600;
+      }
+
+      /* ── MANIFESTO ── */
+      .manifesto {
+        padding: 2rem 0;
+      }
+      .manifesto .section-num {
+        /*
+          EASTER EGG #4: Section numbers in Erlang red.
+
+          Erlang processes are numbered. Supervision trees
+          are numbered. The section numbers here are red
+          because structure — knowing where you are in the
+          system — is Armstrong's gift.
+
+          "If Java is the right one to use for all these
+           problems, why are there any other languages?"
+                                    — Joe Armstrong
+        */
+        display: block;
+        font-size: var(--font-sm);
+        color: var(--erlang);
+        letter-spacing: 0.3em;
+        margin-bottom: 0.25rem;
+        font-weight: 600;
+      }
+      .manifesto h2 {
+        font-size: var(--font-md);
+        color: var(--text-bright);
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        margin-bottom: 1rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 1px solid var(--erlang-dim);
+      }
+      .manifesto p {
+        margin-bottom: 1.25rem;
+      }
+      .manifesto strong {
+        color: var(--text-bright);
+        font-weight: 600;
+      }
+      .manifesto .highlight {
+        color: var(--trimtab);
+        font-weight: 600;
+      }
+      .manifesto section {
+        margin-bottom: 3rem;
+      }
+
+      /* ── BLOCKQUOTE ── */
+      blockquote {
+        border-left: 3px solid var(--erlang);
+        padding-left: 1rem;
+        margin: 1.5rem 0;
+        color: var(--text-dim);
+        font-style: italic;
+        font-size: var(--font-base);
+      }
+      blockquote cite {
+        display: block;
+        margin-top: 0.5rem;
+        font-style: normal;
+        color: var(--titanium-light);
+        font-size: var(--font-sm);
+      }
+
+      /* ── TOOLS ── */
+      .tools {
+        padding: 2rem 0;
+        border-top: 1px solid var(--titanium);
+      }
+      .tools h2 {
+        font-size: var(--font-md);
+        color: var(--text-bright);
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        margin-bottom: 1.5rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 1px solid var(--erlang-dim);
+      }
+      .tool-card {
+        background: transparent;
+        border: none;
+        border-left: 3px solid var(--erlang-dim);
+        padding: 0 0 0 1.25rem;
+        margin-bottom: 1.5rem;
+      }
+      .tool-card h3 {
+        color: var(--text-bright);
+        font-size: var(--font-base);
+        font-weight: 600;
+        margin-bottom: 0.5rem;
+      }
+      .tool-card h3 code {
+        color: var(--trimtab);
+        font-size: var(--font-base);
+      }
+      .tool-card h3 code::before {
+        content: "$ ";
+        color: var(--text-dim);
+      }
+      .tool-card p {
+        font-size: var(--font-sm);
+        color: var(--text-dim);
+        line-height: 1.5;
+      }
+
+      /* ── THINKERS ── */
+      .thinkers {
+        padding: 2rem 0;
+        border-top: 1px solid var(--titanium);
+      }
+      .thinkers h2 {
+        font-size: var(--font-md);
+        color: var(--text-bright);
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        margin-bottom: 1.5rem;
+      }
+      .thinker {
+        display: flex;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+        align-items: baseline;
+      }
+      .thinker .name {
+        flex-shrink: 0;
+        width: 120px;
+        font-size: var(--font-sm);
+        font-weight: 600;
+        color: var(--trimtab-deep);
+        text-align: right;
+      }
+      .thinker .principle {
+        font-size: var(--font-sm);
+        color: var(--text);
+      }
+
+      /* ── FOOTER ── */
+      footer {
+        /*
+          EASTER EGG #5: The footer.
+
+          "Call me Trimtab."
+              — Inscription on R. Buckminster Fuller's
+                 gravestone, Mount Auburn Cemetery,
+                 Cambridge, Massachusetts.
+
+          He died July 1, 1983. His wife Anne died
+          36 hours later. They're buried together.
+          Both stones say "Call me Trimtab."
+
+          If you've read this far into the source code
+          of a static website about development philosophy,
+          you are exactly the kind of person this is for.
+
+          Build something small that steers something big.
+        */
+        padding: 2rem 0;
+        border-top: 1px solid var(--titanium);
+        text-align: center;
+        font-size: var(--font-xs);
+        color: var(--text-dim);
+      }
+      footer a {
+        color: var(--trimtab-deep);
+        text-decoration: none;
+      }
+      footer a:hover {
+        color: var(--trimtab);
+      }
+      footer .gravestone {
+        margin-top: 1rem;
+        font-style: italic;
+        color: var(--titanium-light);
+        font-size: var(--font-xs);
+      }
+
+      /* ── RESPONSIVE ── */
+      @media (max-width: 600px) {
+        html { font-size: 14px; }
+        .thinker { flex-direction: column; gap: 0.25rem; }
+        .thinker .name { text-align: left; width: auto; }
+        nav .links { gap: 1rem; font-size: var(--font-xs); }
+      }
+    </style>
+  </head>
+
+  <body>
+    <!--
+      EASTER EGG #6: The HTML structure.
+
+      This entire page is semantic HTML. No divs-for-layout.
+      No wrapper-wrapper-inner-container. The markup IS the
+      structure, the way Armstrong's message types ARE the
+      protocol.
+
+      Total client-side JavaScript: 0 bytes.
+      Total CSS custom properties named after scientists: 4.
+      Total <div> elements: 0.
+
+      "Perfection is achieved, not when there is nothing
+       more to add, but when there is nothing left to
+       take away."
+                          — Antoine de Saint-Exupéry
+    -->
+
+    <nav>
+      <a href="/" class="logo">
+        <img src="/img/mark.jpg" alt="trimtab mark" width="32" height="32" />
+        <span>trimtab</span>
+      </a>
+      <span class="links">
+        <a href="#manifesto">manifesto</a>
+        <a href="#tools">tools</a>
+        <a href="https://github.com/sportsculture/trimtab">repo</a>
+      </span>
+    </nav>
+
+    <header class="hero">
+      <span class="hero-content">
+        <img class="mark" src="/img/mark.jpg" alt="trimtab mark — nested chevron with titanium texture, amber gold trim tab, construction geometry" width="180" height="180" />
+        <h1>find the <em>small surface</em> that steers the ship</h1>
+      </span>
+    </header>
+
+    <main class="manifesto" id="manifesto">
+
+      <section>
+        <span class="section-num">SEC 01</span>
+        <h2>The Gravestone</h2>
+        <p>Buckminster Fuller's gravestone bears three words: <strong class="highlight">CALL ME TRIMTAB.</strong></p>
+        <p>A trim tab is a small metal surface — six inches wide — hinged to the trailing edge of a ship's rudder. When it moves, it creates a low-pressure zone that pulls the rudder around. The rudder turns the ship. You never push the ship directly.</p>
+        <p>Fuller saw this as a metaphor for how individuals change systems. Not by force. By placement. Find the trailing edge, apply a small precise force, and the geometry of the system does the rest.</p>
+      </section>
+
+      <section>
+        <span class="section-num">SEC 02</span>
+        <h2>Let It Crash</h2>
+        <!--
+          EASTER EGG #7: The Erlang section.
+
+          -module(trimtab).
+          -behaviour(supervisor).
+          -export([start_link/0, init/1]).
+
+          start_link() ->
+              supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+          init([]) ->
+              {ok, {{one_for_one, 5, 10}, [
+                  #{id => rudder,
+                    start => {rudder, start_link, []},
+                    restart => permanent}
+              ]}}.
+
+          %% Three lines of restart strategy.
+          %% One hundred processes governed.
+          %% That's a trim tab.
+        -->
+        <p>Joe Armstrong built Erlang because he understood something similar about failure.</p>
+        <p>Telephone switches need 99.999% uptime. The obvious approach: prevent every possible failure. Armor the hull. The more you prevent, the more complex the prevention becomes, and the more catastrophic the failures you didn't predict.</p>
+        <p>Armstrong's insight was Fuller's insight wearing different clothes: <strong>don't prevent failure — make the geometry resilient to it.</strong></p>
+        <p>An Erlang supervision tree is a trim tab for reliability. Three lines of configuration — a restart strategy — govern the recovery behavior of a hundred concurrent processes. When a process dies, its supervisor restarts it. The individual process doesn't need to be bulletproof. The <em>structure</em> handles the failure.</p>
+        <p>This is tensegrity applied to software. Isolated components floating in a continuous network of message passing. One member fails, the structure holds.</p>
+      </section>
+
+      <section>
+        <span class="section-num">SEC 03</span>
+        <h2>The Discipline Underneath</h2>
+        <p>Donald Knuth spent fifty years writing <em>The Art of Computer Programming</em> because he understood the prerequisite that Fuller and Armstrong's work implies but doesn't always state:</p>
+        <p><strong class="highlight">You can only place a trim tab if you know where the forces converge.</strong></p>
+        <p>Fuller's geometry works because he studied nature's structural principles for decades before designing a single dome. Armstrong's "let it crash" works because he analyzed telephone switching patterns deeply enough to know that restart-from-clean-state solves 90% of failures.</p>
+        <p>Knuth's contribution is the discipline underneath. His obsession with algorithmic analysis isn't academic vanity — it's the practice of understanding a system deeply enough that you can identify the four lines that matter. His famous dictum — "premature optimization is the root of all evil" — is a warning against pushing the hull. Don't apply force until you know where the trailing edge is.</p>
+      </section>
+
+      <section>
+        <span class="section-num">SEC 04</span>
+        <h2>Working With AI</h2>
+        <p>These three principles converge in how we work with AI.</p>
+        <p>As coding agents grow more capable — Claude Code, Codex, OpenCode, and whatever comes next — the instinct is to push the hull. More prompts. More oversight. More dashboards monitoring the AI's work. More process wrapping the AI's output.</p>
+        <p>The trim tab practitioner asks a different question: <strong class="highlight">what's the smallest surface that steers the most behavior?</strong></p>
+        <p>A <code>CLAUDE.md</code> file is a trim tab. A few hundred lines of text that govern every interaction across an entire project. Written well, it makes thousands of micro-corrections unnecessary. Written poorly — or not written at all — and you're back to pushing the hull with every prompt.</p>
+        <p>Memory files are trim tabs that compound. Each session deposits a small insight. Over weeks, those insights accumulate into a navigational surface that steers future sessions without any active effort.</p>
+        <p>Observation systems — like a background process that watches conversation length and triggers reflection — are Armstrong's supervisors applied to AI collaboration. They don't prevent bad outputs. They create a geometry where recovery is automatic.</p>
+        <p>Task structures are Knuth's discipline. Knowing which work matters before the agent starts. The analysis that earns you the right to say "do this, not that" with confidence.</p>
+      </section>
+
+      <section>
+        <span class="section-num">SEC 05</span>
+        <h2>The Smallest Surface</h2>
+        <p>The trim tab principle scales down to a single shell command.</p>
+        <p>Instead of opening eight projects to check what's running, six lines of <code>ss</code> and <code>git log</code> give you the shape of your entire workday. Instead of a sprawling monitoring dashboard, a 30-second <code>watch</code> loop in tmux tells you everything that changed.</p>
+        <p>The question is always the same: <strong class="highlight">what's the smallest surface?</strong></p>
+        <p>Not the most comprehensive. Not the most elegant. Not the most featureful. The smallest surface that, placed on the trailing edge, steers the ship.</p>
+
+        <blockquote>
+          Fuller. Armstrong. Knuth. Three people who understood that the world is moved not by the biggest force, but by the best-placed one.
+        </blockquote>
+      </section>
+
+    </main>
+
+    <section class="thinkers">
+      <h2>The Three Principles</h2>
+      <article class="thinker">
+        <span class="name">Fuller</span>
+        <span class="principle">Ephemeralization — do more with less. A six-inch surface steers a transatlantic ship. Geometry over force.</span>
+      </article>
+      <article class="thinker">
+        <span class="name">Armstrong</span>
+        <span class="principle">Let it crash — don't prevent failure, make the structure resilient to it. Three lines of restart strategy govern a hundred processes.</span>
+      </article>
+      <article class="thinker">
+        <span class="name">Knuth</span>
+        <span class="principle">Algorithmic rigor — you can only place a trim tab if you've done the analysis to know where the forces converge.</span>
+      </article>
+    </section>
+
+    <section class="tools" id="tools">
+      <!--
+        EASTER EGG #8: The SR-71 connection.
+
+        The SR-71 Blackbird was the ultimate trim tab aircraft.
+        Kelly Johnson's Skunk Works built it with 14 rules —
+        minimum team, minimum reporting, maximum understanding.
+
+        The corrugated titanium skin was designed to expand at
+        Mach 3 operating temperature, not at room temperature.
+        The plane leaked fuel on the runway because it was
+        engineered for the operating condition, not the idle
+        state. That's Armstrong's "let it crash" applied to
+        metallurgy.
+
+        The tires were made by Goodyear in Akron, Ohio.
+        Aluminum-infused rubber that could handle landing
+        at 200+ mph after the airframe had baked at 600°F.
+
+        The smallest component. The point where the most
+        advanced aircraft ever built touches the ground.
+        Made by craftspeople in Ohio.
+
+        That's a trim tab.
+      -->
+      <h2>Tools</h2>
+      <article class="tool-card">
+        <h3><code>trimtab status</code></h3>
+        <p>Phone-friendly status of your entire dev environment in under 3 seconds. Dev servers, Claude sessions, git activity, Docker containers, system resources, remote GPU. Six sections, one command, fits 60 characters wide.</p>
+      </article>
+      <article class="tool-card">
+        <h3><code>trimtab dash</code></h3>
+        <p>Persistent tmux dashboard. Auto-refreshing <code>trimtab status</code> in the top pane, interactive shell below. Survives SSH disconnects. Attach-or-create pattern — always there when you need it.</p>
+      </article>
+    </section>
+
+    <footer>
+      <p>
+        <a href="https://github.com/sportsculture/trimtab">GitHub</a> ·
+        <a href="https://graybeam.tech">Gray Beam Technology</a>
+      </p>
+      <p class="gravestone">Call me Trimtab.</p>
+    </footer>
+
+  </body>
+</html>

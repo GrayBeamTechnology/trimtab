@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# workdash - Persistent tmux dashboard for remote monitoring
+# Attach-or-create pattern: survives phone disconnects
+set -euo pipefail
+
+SESSION="dashboard"
+
+# Attach if already exists
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  exec tmux attach-session -t "$SESSION"
+fi
+
+# Create new session with workstatus in top pane
+tmux new-session -d -s "$SESSION" -x 80 -y 24
+
+# Configure session
+tmux set-option -t "$SESSION" destroy-unattached off
+tmux set-option -t "$SESSION" status-left '#[fg=green,bold] DASH '
+tmux set-option -t "$SESSION" status-right '#[fg=white]%H:%M'
+tmux set-option -t "$SESSION" status-bg colour235
+tmux set-option -t "$SESSION" status-fg white
+
+# Top pane: auto-refreshing workstatus
+tmux send-keys -t "$SESSION" "watch -c -n 30 $HOME/bin/workstatus" Enter
+
+# Bottom pane: interactive shell (25% height)
+tmux split-window -t "$SESSION" -v -l '25%'
+
+# Focus top pane by default
+tmux select-pane -t "$SESSION":1.1
+
+# Attach
+exec tmux attach-session -t "$SESSION"
