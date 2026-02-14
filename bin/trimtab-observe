@@ -199,6 +199,62 @@ else
 fi
 
 # ============================================================
+# LESSONS — recently changed pitfalls/lessons (for AI context)
+# ============================================================
+RECENT_LESSONS=""
+lessons_found=0
+
+# Extract lessons from recently modified CLAUDE.md files
+for proj_dir in "$PROJECTS_DIR"/*/; do
+  [[ -f "$proj_dir/CLAUDE.md" ]] || continue
+  proj=$(basename "$proj_dir")
+  mod=$(stat -c '%Y' "$proj_dir/CLAUDE.md" 2>/dev/null || echo 0)
+  threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+  (( mod <= threshold )) && continue
+
+  extracted=$(awk '
+    /^##+ .*(Pitfall|Gotcha|Known Issue|Errors|Lesson|Regression|Warning)/ { capture=1; next }
+    /^##+ / { capture=0 }
+    capture && /^[[:space:]]*[-*]/ { print }
+  ' "$proj_dir/CLAUDE.md" 2>/dev/null)
+
+  if [[ -n "$extracted" ]]; then
+    count=$(echo "$extracted" | wc -l)
+    RECENT_LESSONS+="LESSONS ($proj, $count items): $extracted"$'\n'
+    lessons_found=$((lessons_found + count))
+  fi
+done
+
+# Extract from recently modified memory files
+for memdir in "$HOME"/.claude/projects/-home-mchughson-1-Projects-*/memory; do
+  [[ -d "$memdir" ]] || continue
+  proj=$(basename "$(dirname "$memdir")" | sed 's/-home-mchughson-1-Projects-//')
+  for md_file in "$memdir"/*.md; do
+    [[ -f "$md_file" ]] || continue
+    mod=$(stat -c '%Y' "$md_file" 2>/dev/null || echo 0)
+    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    (( mod <= threshold )) && continue
+
+    extracted=$(awk '
+      /^##+ .*(Lesson|Error|Pitfall|Mistake|Fix|Warning|Concern|Bug)/ { capture=1; next }
+      /^##+ / { capture=0 }
+      capture && /^[[:space:]]*[-*]/ { print }
+    ' "$md_file" 2>/dev/null)
+
+    if [[ -n "$extracted" ]]; then
+      count=$(echo "$extracted" | wc -l)
+      fname=$(basename "$md_file")
+      RECENT_LESSONS+="LESSONS ($proj/$fname, $count items): $extracted"$'\n'
+      lessons_found=$((lessons_found + count))
+    fi
+  done
+done
+
+if (( lessons_found > 0 )); then
+  add_obs "LESSONS: $lessons_found recently documented lessons across projects"
+fi
+
+# ============================================================
 # AI BRIEFING — optional LLM summary
 # ============================================================
 if [[ "$AI_MODE" == true ]]; then
@@ -222,21 +278,42 @@ if [[ "$AI_MODE" == true ]]; then
   else
     printf "  ${D}Generating briefing...${N}\r"
 
-    BRIEFING=$(python3 << PYEOF
-import json, urllib.request, sys
+    # Write data to temp files to avoid heredoc/f-string escaping issues
+    tmpdir=$(mktemp -d)
+    printf '%s' "$API_KEY" > "$tmpdir/api_key"
+    printf '%s' "$RAW_OBSERVATIONS" > "$tmpdir/observations"
+    printf '%s' "$RECENT_LESSONS" > "$tmpdir/lessons"
 
-api_key = "$API_KEY"
-observations = """$RAW_OBSERVATIONS"""
+    BRIEFING=$(python3 -c '
+import json, urllib.request, sys, re, os
 
-prompt = f"""You are a concise technical briefing generator. Given these raw observations about a developer's project ecosystem, generate a 3-5 sentence briefing that:
-1. Highlights the most significant activity
-2. Notes any patterns (multiple projects touched, themes)
-3. Flags anything that might need attention
+tmpdir = sys.argv[1]
+api_key = open(f"{tmpdir}/api_key").read().strip()
+observations = open(f"{tmpdir}/observations").read()
+lessons = open(f"{tmpdir}/lessons").read()
+
+prompt = """You are a concise technical briefing generator for a developer'\''s project ecosystem. Generate a briefing with two sections:
+
+## Activity
+3-5 sentences covering:
+1. Most significant activity (commits, sessions, changes)
+2. Patterns across projects
+3. Anything needing attention
+
+## Lessons Learned
+If lessons were recently documented, highlight:
+1. New cross-project patterns (lessons appearing in 2+ projects)
+2. Any lesson that should be promoted to global rules
+3. Recurring themes
+If no recent lessons, say "No new lessons documented."
 
 Be concise and direct. No pleasantries. Use project names. /no_think
 
 Raw observations:
-{observations}"""
+""" + observations + """
+
+Recently documented lessons:
+""" + (lessons if lessons.strip() else "None")
 
 payload = json.dumps({
     "model": "qwen/qwen3-32b",
@@ -258,15 +335,14 @@ try:
     resp = urllib.request.urlopen(req, timeout=30)
     data = json.loads(resp.read())
     content = data["choices"][0]["message"]["content"]
-    # Strip any thinking tags from qwen
-    import re
-    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
     print(content)
 except Exception as e:
     print(f"Error: {e}", file=sys.stderr)
     sys.exit(1)
-PYEOF
+' "$tmpdir"
     )
+    rm -rf "$tmpdir"
 
     if [[ -n "$BRIEFING" ]]; then
       printf "  \033[2K"  # clear the "Generating..." line
