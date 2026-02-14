@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # trimtab steer — audit and manage trim tab infrastructure across projects
-# Shows CLAUDE.md, memory files, skills, and config drift
+# Shows CLAUDE.md, memory files, skills, quality tools, and config drift
 set -euo pipefail
 
 R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
@@ -90,16 +90,27 @@ cmd_audit() {
       printf "    ${A}%s${N}\n" "$skill_name"
     done < <(find "$HOME/.claude/skills" -name "SKILL.md" 2>/dev/null | sort)
   fi
+
+  # Global hooks
+  if [[ -f "$HOME/.claude/settings.json" ]] && grep -q '"hooks"' "$HOME/.claude/settings.json" 2>/dev/null; then
+    printf "  ${G}●${N} Global Claude hooks           ${D}(active)${N}\n"
+  else
+    printf "  ${R}●${N} Global Claude hooks           ${D}(none)${N}\n"
+  fi
 }
 
 # ============================================================
 # GAPS — show projects missing key infrastructure
 # ============================================================
 cmd_gaps() {
-  section "Projects Missing Trim Tabs"
+  section "Projects Missing Infrastructure"
 
   local missing_claude=()
   local missing_git=()
+  local missing_hook=()
+  local missing_credo=()
+  local missing_precommit=()
+  local missing_ci=()
 
   for proj_dir in "$PROJECTS_DIR"/*/; do
     [[ -d "$proj_dir" ]] || continue
@@ -108,28 +119,84 @@ cmd_gaps() {
     # Skip non-code directories
     [[ -d "$proj_dir/.git" ]] || [[ -f "$proj_dir/mix.exs" ]] || [[ -f "$proj_dir/package.json" ]] || continue
 
+    # Universal checks
     if [[ ! -f "$proj_dir/CLAUDE.md" ]]; then
       missing_claude+=("$proj")
     fi
     if [[ ! -d "$proj_dir/.git" ]]; then
       missing_git+=("$proj")
     fi
+
+    # Git hook check
+    if [[ -d "$proj_dir/.git" ]] && [[ ! -x "$proj_dir/.git/hooks/pre-commit" ]]; then
+      missing_hook+=("$proj")
+    fi
+
+    # Elixir-specific checks
+    if [[ -f "$proj_dir/mix.exs" ]]; then
+      if ! grep -q "credo" "$proj_dir/mix.exs" 2>/dev/null; then
+        missing_credo+=("$proj")
+      fi
+      if ! grep -q "precommit" "$proj_dir/mix.exs" 2>/dev/null; then
+        missing_precommit+=("$proj")
+      fi
+    fi
+
+    # CI/CD check
+    if [[ -d "$proj_dir/.git" ]]; then
+      has_ci=false
+      [[ -d "$proj_dir/.github/workflows" ]] && has_ci=true
+      [[ -f "$proj_dir/.gitlab-ci.yml" ]] && has_ci=true
+      if ! $has_ci; then
+        missing_ci+=("$proj")
+      fi
+    fi
   done
 
+  # Report each category
   if (( ${#missing_claude[@]} > 0 )); then
     printf "  ${Y}No CLAUDE.md:${N}\n"
-    for p in "${missing_claude[@]}"; do
-      printf "    ${R}●${N} %s\n" "$p"
-    done
-  else
-    printf "  ${G}All code projects have CLAUDE.md${N}\n"
+    for p in "${missing_claude[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+    printf "\n"
   fi
 
   if (( ${#missing_git[@]} > 0 )); then
-    printf "\n  ${Y}No git repo:${N}\n"
-    for p in "${missing_git[@]}"; do
-      printf "    ${R}●${N} %s\n" "$p"
-    done
+    printf "  ${Y}No git repo:${N}\n"
+    for p in "${missing_git[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+    printf "\n"
+  fi
+
+  if (( ${#missing_hook[@]} > 0 )); then
+    printf "  ${Y}No pre-commit hook:${N}\n"
+    for p in "${missing_hook[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+    printf "\n"
+  fi
+
+  if (( ${#missing_credo[@]} > 0 )); then
+    printf "  ${Y}Elixir without Credo:${N}\n"
+    for p in "${missing_credo[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+    printf "\n"
+  fi
+
+  if (( ${#missing_precommit[@]} > 0 )); then
+    printf "  ${Y}Elixir without mix precommit:${N}\n"
+    for p in "${missing_precommit[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+    printf "\n"
+  fi
+
+  if (( ${#missing_ci[@]} > 0 )); then
+    printf "  ${Y}No CI/CD pipeline:${N}\n"
+    for p in "${missing_ci[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+    printf "\n"
+  fi
+
+  # Summary
+  local total_gaps=$(( ${#missing_claude[@]} + ${#missing_hook[@]} + ${#missing_credo[@]} + ${#missing_precommit[@]} + ${#missing_ci[@]} ))
+  if (( total_gaps == 0 )); then
+    printf "  ${G}All projects have full quality infrastructure.${N}\n"
+  else
+    printf "  ${D}Total gaps: %d across all categories${N}\n" "$total_gaps"
+    printf "  ${D}Fix with: trimtab init <project>${N}\n"
   fi
 }
 

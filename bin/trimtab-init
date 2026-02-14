@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # trimtab init — bootstrap trim tab infrastructure for a project
-# Adds CLAUDE.md, memory structure, and .claude config
+# Detects project type and sets up quality stack accordingly
 set -euo pipefail
 
 R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
@@ -33,6 +33,20 @@ add_file() {
   printf '%s' "$content" > "$path"
   created+=("$label")
 }
+
+# ── Detect project type ──
+proj_type="unknown"
+if [[ -f "$TARGET/mix.exs" ]]; then
+  proj_type="elixir"
+elif [[ -d "$TARGET/apps" ]] && ls "$TARGET"/apps/*/mix.exs &>/dev/null; then
+  proj_type="elixir-umbrella"
+elif [[ -f "$TARGET/package.json" ]]; then
+  proj_type="node"
+elif [[ -f "$TARGET/Cargo.toml" ]]; then
+  proj_type="rust"
+elif [[ -f "$TARGET/requirements.txt" ]] || [[ -f "$TARGET/pyproject.toml" ]] || [[ -f "$TARGET/setup.py" ]]; then
+  proj_type="python"
+fi
 
 # ── CLAUDE.md ──
 add_file "$TARGET/CLAUDE.md" "# ${PROJ} — Claude Code Instructions
@@ -94,8 +108,145 @@ else
 " ".gitignore"
 fi
 
+# ══════════════════════════════════════════════════════════════
+# PROJECT-TYPE-SPECIFIC QUALITY INFRASTRUCTURE
+# ══════════════════════════════════════════════════════════════
+
+if [[ "$proj_type" == "elixir" || "$proj_type" == "elixir-umbrella" ]]; then
+  # ── Credo dependency check ──
+  if ! grep -q "credo" "$TARGET/mix.exs" 2>/dev/null; then
+    printf "  ${Y}!${N} Credo not in deps — add {:credo, \"~> 1.7\", only: [:dev, :test], runtime: false}\n"
+  else
+    skipped+=("Credo (already in deps)")
+  fi
+
+  # ── mix precommit alias check ──
+  if ! grep -q "precommit" "$TARGET/mix.exs" 2>/dev/null; then
+    printf "  ${Y}!${N} No mix precommit alias — add to aliases in mix.exs\n"
+  else
+    skipped+=("mix precommit (already defined)")
+  fi
+
+  # ── Git pre-commit hook ──
+  if [[ -d "$TARGET/.git" ]]; then
+    hook_path="$TARGET/.git/hooks/pre-commit"
+    if [[ ! -f "$hook_path" ]]; then
+      cat > "$hook_path" <<'HOOK'
+#!/usr/bin/env bash
+# Enforce mix precommit before every commit
+set -e
+echo "Running mix precommit..."
+mix precommit
+HOOK
+      chmod +x "$hook_path"
+      created+=("git pre-commit hook (mix precommit)")
+    else
+      skipped+=("git pre-commit hook (exists)")
+    fi
+  fi
+
+  # ── .formatter.exs check ──
+  if [[ ! -f "$TARGET/.formatter.exs" ]]; then
+    printf "  ${Y}!${N} No .formatter.exs — run mix format --check-formatted to verify\n"
+  else
+    skipped+=(".formatter.exs (exists)")
+  fi
+
+elif [[ "$proj_type" == "node" ]]; then
+  # ── ESLint check ──
+  if ! ls "$TARGET"/eslint.config.* "$TARGET"/.eslintrc* &>/dev/null 2>&1; then
+    printf "  ${Y}!${N} No ESLint config — consider adding eslint.config.js\n"
+  else
+    skipped+=("ESLint config (exists)")
+  fi
+
+  # ── TypeScript check ──
+  if [[ ! -f "$TARGET/tsconfig.json" ]]; then
+    printf "  ${Y}!${N} No tsconfig.json — consider TypeScript for type safety\n"
+  else
+    skipped+=("tsconfig.json (exists)")
+  fi
+
+  # ── Git pre-commit hook (npm test) ──
+  if [[ -d "$TARGET/.git" ]]; then
+    hook_path="$TARGET/.git/hooks/pre-commit"
+    if [[ ! -f "$hook_path" ]]; then
+      cat > "$hook_path" <<'HOOK'
+#!/usr/bin/env bash
+# Enforce npm test before every commit
+set -e
+echo "Running npm test..."
+npm test
+HOOK
+      chmod +x "$hook_path"
+      created+=("git pre-commit hook (npm test)")
+    else
+      skipped+=("git pre-commit hook (exists)")
+    fi
+  fi
+
+elif [[ "$proj_type" == "rust" ]]; then
+  # ── Clippy check ──
+  if command -v cargo &>/dev/null; then
+    skipped+=("cargo available")
+  else
+    printf "  ${Y}!${N} cargo not found — install via rustup\n"
+  fi
+
+  # ── rust-toolchain.toml check ──
+  if [[ ! -f "$TARGET/rust-toolchain.toml" ]] && [[ ! -f "$TARGET/rust-toolchain" ]]; then
+    printf "  ${Y}!${N} No rust-toolchain.toml — consider pinning toolchain version\n"
+  else
+    skipped+=("rust-toolchain (exists)")
+  fi
+
+  # ── rustfmt.toml check ──
+  if [[ ! -f "$TARGET/rustfmt.toml" ]] && [[ ! -f "$TARGET/.rustfmt.toml" ]]; then
+    printf "  ${Y}!${N} No rustfmt.toml — consider adding format config\n"
+  else
+    skipped+=("rustfmt config (exists)")
+  fi
+
+  # ── clippy.toml check ──
+  if [[ ! -f "$TARGET/clippy.toml" ]] && [[ ! -f "$TARGET/.clippy.toml" ]]; then
+    skipped+=("clippy.toml (using defaults)")
+  else
+    skipped+=("clippy config (exists)")
+  fi
+
+  # ── Git pre-commit hook ──
+  if [[ -d "$TARGET/.git" ]]; then
+    hook_path="$TARGET/.git/hooks/pre-commit"
+    if [[ ! -f "$hook_path" ]]; then
+      cat > "$hook_path" <<'HOOK'
+#!/usr/bin/env bash
+# Enforce cargo checks before every commit
+set -e
+echo "Running cargo fmt check..."
+cargo fmt --all -- --check
+echo "Running cargo clippy..."
+cargo clippy --all-targets --all-features -- -D warnings
+echo "Running cargo test..."
+cargo test --all
+HOOK
+      chmod +x "$hook_path"
+      created+=("git pre-commit hook (fmt + clippy + test)")
+    else
+      skipped+=("git pre-commit hook (exists)")
+    fi
+  fi
+
+elif [[ "$proj_type" == "python" ]]; then
+  # ── pre-commit framework check ──
+  if [[ ! -f "$TARGET/.pre-commit-config.yaml" ]]; then
+    printf "  ${Y}!${N} No .pre-commit-config.yaml — consider the pre-commit framework\n"
+  else
+    skipped+=(".pre-commit-config.yaml (exists)")
+  fi
+fi
+
 # ── Report ──
-printf "\n${B}${C}── trimtab init: %s${N}\n\n" "$PROJ"
+printf "\n${B}${C}── trimtab init: %s${N}  ${D}(%s)${N}\n\n" "$PROJ" "$proj_type"
 
 if (( ${#created[@]} > 0 )); then
   for item in "${created[@]}"; do
