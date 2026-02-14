@@ -77,7 +77,7 @@ Creates: `CLAUDE.md` (template), `.claude/settings.json`, `~/.claude/projects/..
 
 ```bash
 # Clone and link
-git clone https://github.com/sportsculture/trimtab.git
+git clone https://github.com/GrayBeamTechnology/trimtab.git
 ln -s "$(pwd)/trimtab/bin/trimtab" ~/bin/trimtab
 for cmd in trimtab/bin/trimtab-*; do
   ln -s "$(pwd)/$cmd" ~/bin/$(basename "$cmd")
