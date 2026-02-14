@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# trimtab init — bootstrap trim tab infrastructure for a project
+# Adds CLAUDE.md, memory structure, and .claude config
+set -euo pipefail
+
+R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
+B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
+N=$'\033[0m'
+
+TARGET="${1:-.}"
+TARGET=$(readlink -f "$TARGET")
+PROJ=$(basename "$TARGET")
+
+if [[ ! -d "$TARGET" ]]; then
+  echo "trimtab init: '$TARGET' is not a directory" >&2
+  exit 1
+fi
+
+created=()
+skipped=()
+
+add_file() {
+  local path="$1"
+  local content="$2"
+  local label="$3"
+
+  if [[ -f "$path" ]]; then
+    skipped+=("$label (exists)")
+    return
+  fi
+
+  mkdir -p "$(dirname "$path")"
+  printf '%s' "$content" > "$path"
+  created+=("$label")
+}
+
+# ── CLAUDE.md ──
+add_file "$TARGET/CLAUDE.md" "# ${PROJ} — Claude Code Instructions
+
+## What This Is
+
+[Brief description of the project]
+
+## Architecture
+
+[Key architectural decisions and patterns]
+
+## Common Pitfalls
+
+- [Pitfall 1]
+- [Pitfall 2]
+
+## File Structure
+
+\`\`\`
+[Key directories and files]
+\`\`\`
+" "CLAUDE.md"
+
+# ── .claude/settings.json ──
+add_file "$TARGET/.claude/settings.json" '{
+  "allowedTools": [
+    "Edit",
+    "Write",
+    "Bash(git *)",
+    "Bash(mix *)",
+    "Bash(npm *)"
+  ]
+}
+' ".claude/settings.json"
+
+# ── Memory directory (project-scoped in ~/.claude/) ──
+memory_dir="$HOME/.claude/projects/-home-mchughson-1-Projects-${PROJ}/memory"
+add_file "$memory_dir/MEMORY.md" "# ${PROJ} — Project Memory
+
+## Architecture Decisions
+
+## Lessons Learned
+
+## Key Patterns
+" "~/.claude/projects/.../memory/MEMORY.md"
+
+# ── .gitignore additions ──
+if [[ -f "$TARGET/.gitignore" ]]; then
+  if ! grep -q "\.claude/" "$TARGET/.gitignore" 2>/dev/null; then
+    printf "\n# Claude Code\n.claude/\n" >> "$TARGET/.gitignore"
+    created+=(".gitignore (appended .claude/)")
+  else
+    skipped+=(".gitignore (.claude/ already listed)")
+  fi
+else
+  add_file "$TARGET/.gitignore" "# Claude Code
+.claude/
+" ".gitignore"
+fi
+
+# ── Report ──
+printf "\n${B}${C}── trimtab init: %s${N}\n\n" "$PROJ"
+
+if (( ${#created[@]} > 0 )); then
+  for item in "${created[@]}"; do
+    printf "  ${G}+${N} %s\n" "$item"
+  done
+fi
+
+if (( ${#skipped[@]} > 0 )); then
+  for item in "${skipped[@]}"; do
+    printf "  ${D}· %s${N}\n" "$item"
+  done
+fi
+
+printf "\n${D}Run 'trimtab steer audit' to see all projects.${N}\n"

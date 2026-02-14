@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# trimtab — find the small surface that steers the ship
+#
+# Subcommand dispatcher. Each subcommand lives at ~/bin/trimtab-{cmd}.
+# Usage: trimtab <command> [args...]
+set -euo pipefail
+
+SELF=$(basename "$0")
+BINDIR=$(dirname "$(readlink -f "$0")")
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+subcmd="$BINDIR/trimtab-$cmd"
+
+if [[ -x "$subcmd" ]]; then
+  exec "$subcmd" "$@"
+fi
+
+case "$cmd" in
+  help|-h|--help)
+    cat <<EOF
+${SELF} — find the small surface that steers the ship
+
+Usage: ${SELF} <command> [args...]
+
+Commands:
+  status    Dev environment status (phone-friendly, <3s)
+  dash      Persistent tmux dashboard
+  observe   Cross-project briefing (what happened since you last looked)
+  steer     Audit trim tab infrastructure across projects
+  init      Bootstrap trim tab config for a project
+
+https://trimtab.dev
+EOF
+    ;;
+  *)
+    echo "${SELF}: unknown command '$cmd'" >&2
+    echo "Run '${SELF} help' for usage." >&2
+    exit 1
+    ;;
+esac

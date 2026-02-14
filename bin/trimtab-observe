@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# trimtab observe — cross-project briefing
+# What happened across your agent ecosystem since you last looked?
+#
+# Inspired by Uncle's Observer pattern:
+#   Observer accumulates tokens → extracts observations → Reflector compresses
+#   Here we accumulate git/session/memory signals → extract a briefing
+set -uo pipefail
+
+R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
+B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
+A=$'\033[0;33m'   N=$'\033[0m'
+
+PROJECTS_DIR="$HOME/1-Projects"
+SINCE="24h"
+AI_MODE=false
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --since) SINCE="$2"; shift 2 ;;
+    --ai)    AI_MODE=true; shift ;;
+    -h|--help)
+      cat <<EOF
+trimtab observe — cross-project briefing
+
+Usage: trimtab observe [--since PERIOD] [--ai]
+
+Options:
+  --since PERIOD   Time window (default: 24h)
+                   Examples: 24h, 2d, 1w, "2 days ago"
+  --ai             Generate AI-summarized briefing (requires OPENROUTER_API_KEY)
+
+Examples:
+  trimtab observe                  # Last 24 hours
+  trimtab observe --since 2d       # Last 2 days
+  trimtab observe --since 1w --ai  # Last week, AI-summarized
+EOF
+      exit 0
+      ;;
+    *) SINCE="$1"; shift ;;
+  esac
+done
+
+# Normalize time period for git
+normalize_since() {
+  local s="$1"
+  case "$s" in
+    *h) echo "${s%h} hours ago" ;;
+    *d) echo "${s%d} days ago" ;;
+    *w) echo "${s%w} weeks ago" ;;
+    *)  echo "$s" ;;
+  esac
+}
+
+GIT_SINCE=$(normalize_since "$SINCE")
+
+section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
+
+# Collect raw observations for potential AI summary
+RAW_OBSERVATIONS=""
+add_obs() { RAW_OBSERVATIONS+="$1"$'\n'; }
+
+# ============================================================
+# GIT ACTIVITY — what shipped
+# ============================================================
+section "Shipped (git since $SINCE)"
+found_git=0
+for repo in "$PROJECTS_DIR"/*/; do
+  [[ -d "$repo/.git" ]] || continue
+  proj=$(basename "$repo")
+
+  commits=$({ git -C "$repo" log --oneline --since="$GIT_SINCE" 2>/dev/null || true; })
+  [[ -z "$commits" ]] && continue
+  count=$(echo "$commits" | wc -l)
+  count=$((count + 0))  # ensure numeric
+  (( count == 0 )) && continue
+
+  # Get latest commit subject
+  last=$(echo "$commits" | head -1 | cut -c1-55)
+
+  printf "  ${G}%2d${N}  %-20s ${D}%s${N}\n" "$count" "$proj" "$last"
+  add_obs "GIT: $proj — $count commits. Latest: $last"
+  found_git=1
+done
+
+(( found_git == 0 )) && printf "  ${D}no commits in this period${N}\n"
+
+# ============================================================
+# CLAUDE SESSIONS — what's running now
+# ============================================================
+section "Active Sessions"
+found_claude=0
+while IFS= read -r pid; do
+  [[ -z "$pid" ]] && continue
+  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+  proj=$(basename "$cwd")
+  elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
+  printf "  ${G}●${N} %-22s ${D}%s${N}\n" "$proj" "$elapsed"
+  add_obs "SESSION: $proj — running for $elapsed"
+  found_claude=1
+done < <(pgrep -x claude 2>/dev/null || true)
+
+(( found_claude == 0 )) && printf "  ${D}none${N}\n"
+
+# ============================================================
+# MEMORY CHANGES — what was learned
+# ============================================================
+section "Memory Changes (since $SINCE)"
+found_memory=0
+
+# Check global memory
+global_memory="$HOME/.claude/projects/-home-mchughson-1-Projects/memory"
+if [[ -d "$global_memory" ]]; then
+  while IFS= read -r memfile; do
+    [[ -z "$memfile" ]] && continue
+    fname=$(basename "$memfile")
+    mod=$(stat -c '%Y' "$memfile" 2>/dev/null || echo 0)
+    # Convert SINCE to seconds for comparison
+    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    if (( mod > threshold )); then
+      printf "  ${A}●${N} global/%s ${D}(modified)${N}\n" "$fname"
+      add_obs "MEMORY: global/$fname updated"
+      found_memory=1
+    fi
+  done < <(find "$global_memory" -name "*.md" 2>/dev/null)
+fi
+
+# Check per-project memory
+for memdir in "$HOME"/.claude/projects/-home-mchughson-1-Projects-*/memory; do
+  [[ -d "$memdir" ]] || continue
+  proj=$(basename "$(dirname "$memdir")" | sed 's/-home-mchughson-1-Projects-//')
+  while IFS= read -r memfile; do
+    [[ -z "$memfile" ]] && continue
+    fname=$(basename "$memfile")
+    mod=$(stat -c '%Y' "$memfile" 2>/dev/null || echo 0)
+    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    if (( mod > threshold )); then
+      printf "  ${A}●${N} %s/%s ${D}(modified)${N}\n" "$proj" "$fname"
+      add_obs "MEMORY: $proj/$fname updated"
+      found_memory=1
+    fi
+  done < <(find "$memdir" -name "*.md" 2>/dev/null)
+done
+
+(( found_memory == 0 )) && printf "  ${D}no changes${N}\n"
+
+# ============================================================
+# CONFIG CHANGES — trim tabs that moved
+# ============================================================
+section "Config Changes (since $SINCE)"
+found_config=0
+
+for proj_dir in "$PROJECTS_DIR"/*/; do
+  [[ -d "$proj_dir" ]] || continue
+  proj=$(basename "$proj_dir")
+
+  for cfg in "$proj_dir/CLAUDE.md" "$proj_dir/.claude/settings.json" "$proj_dir/.claude/settings.local.json"; do
+    [[ -f "$cfg" ]] || continue
+    mod=$(stat -c '%Y' "$cfg" 2>/dev/null || echo 0)
+    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    if (( mod > threshold )); then
+      cfgname=$(basename "$cfg")
+      printf "  ${Y}●${N} %s/%s ${D}(modified)${N}\n" "$proj" "$cfgname"
+      add_obs "CONFIG: $proj/$cfgname changed"
+      found_config=1
+    fi
+  done
+done
+
+# Check global CLAUDE.md
+if [[ -f "$HOME/.claude/CLAUDE.md" ]]; then
+  mod=$(stat -c '%Y' "$HOME/.claude/CLAUDE.md" 2>/dev/null || echo 0)
+  threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+  if (( mod > threshold )); then
+    printf "  ${Y}●${N} ~/.claude/CLAUDE.md ${D}(global config modified)${N}\n"
+    add_obs "CONFIG: global CLAUDE.md changed"
+    found_config=1
+  fi
+fi
+
+(( found_config == 0 )) && printf "  ${D}no changes${N}\n"
+
+# ============================================================
+# DOCKER — infrastructure state
+# ============================================================
+section "Infrastructure"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  containers=$(docker ps --format '{{.Names}}' 2>/dev/null | wc -l)
+  if (( containers > 0 )); then
+    printf "  ${G}%d${N} Docker containers running\n" "$containers"
+    docker ps --format '  {{.Names}}  {{.Status}}' 2>/dev/null | head -5
+    (( containers > 5 )) && printf "  ${D}...and %d more${N}\n" "$((containers - 5))"
+  else
+    printf "  ${D}no containers${N}\n"
+  fi
+else
+  printf "  ${D}docker not available${N}\n"
+fi
+
+# ============================================================
+# AI BRIEFING — optional LLM summary
+# ============================================================
+if [[ "$AI_MODE" == true ]]; then
+  section "AI Briefing"
+
+  # Find API key
+  API_KEY=""
+  for envfile in "$HOME/1-Projects/decision_forge_v2/.env" "$HOME/1-Projects/ai-brand-studio/.env" "$HOME/.env"; do
+    if [[ -f "$envfile" ]]; then
+      key=$(grep '^OPENROUTER_API_KEY=' "$envfile" 2>/dev/null | cut -d= -f2-)
+      if [[ -n "$key" ]]; then
+        API_KEY="$key"
+        break
+      fi
+    fi
+  done
+
+  if [[ -z "$API_KEY" ]]; then
+    printf "  ${R}No OPENROUTER_API_KEY found${N}\n"
+    printf "  ${D}Add to decision_forge_v2/.env or ~/.env${N}\n"
+  else
+    printf "  ${D}Generating briefing...${N}\r"
+
+    BRIEFING=$(python3 << PYEOF
+import json, urllib.request, sys
+
+api_key = "$API_KEY"
+observations = """$RAW_OBSERVATIONS"""
+
+prompt = f"""You are a concise technical briefing generator. Given these raw observations about a developer's project ecosystem, generate a 3-5 sentence briefing that:
+1. Highlights the most significant activity
+2. Notes any patterns (multiple projects touched, themes)
+3. Flags anything that might need attention
+
+Be concise and direct. No pleasantries. Use project names. /no_think
+
+Raw observations:
+{observations}"""
+
+payload = json.dumps({
+    "model": "qwen/qwen3-32b",
+    "messages": [{"role": "user", "content": prompt}],
+    "max_tokens": 2000,
+    "temperature": 0.3
+}).encode()
+
+req = urllib.request.Request(
+    "https://openrouter.ai/api/v1/chat/completions",
+    data=payload,
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+)
+
+try:
+    resp = urllib.request.urlopen(req, timeout=30)
+    data = json.loads(resp.read())
+    content = data["choices"][0]["message"]["content"]
+    # Strip any thinking tags from qwen
+    import re
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    print(content)
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    )
+
+    if [[ -n "$BRIEFING" ]]; then
+      printf "  \033[2K"  # clear the "Generating..." line
+      echo "$BRIEFING" | while IFS= read -r line; do
+        printf "  %s\n" "$line"
+      done
+    fi
+  fi
+fi
+
+# ============================================================
+# FOOTER
+# ============================================================
+printf "\n${D}%s — observed since %s${N}\n" "$(date '+%H:%M %a %b %d')" "$SINCE"

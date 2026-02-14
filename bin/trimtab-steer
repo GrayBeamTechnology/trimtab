@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# trimtab steer — audit and manage trim tab infrastructure across projects
+# Shows CLAUDE.md, memory files, skills, and config drift
+set -euo pipefail
+
+R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
+B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
+A=$'\033[0;33m'   N=$'\033[0m'
+
+PROJECTS_DIR="$HOME/1-Projects"
+CMD="${1:-audit}"
+
+section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
+
+# ============================================================
+# AUDIT — show trim tab infrastructure across all projects
+# ============================================================
+cmd_audit() {
+  section "Trim Tab Infrastructure"
+  printf "  ${D}%-22s %s %s %s %s %s${N}\n" "PROJECT" "CLAUDE" "MEMORY" "SKILL" "TASKS" "GIT"
+  printf "  ${D}%-22s %s %s %s %s %s${N}\n" "───────" "──────" "──────" "─────" "─────" "───"
+
+  for proj_dir in "$PROJECTS_DIR"/*/; do
+    [[ -d "$proj_dir" ]] || continue
+    proj=$(basename "$proj_dir")
+
+    # Check for each trim tab
+    has_claude="  ${D}·${N} "
+    has_memory="  ${D}·${N} "
+    has_skills="  ${D}·${N} "
+    has_tasks="  ${D}·${N} "
+    has_git="  ${D}·${N} "
+
+    # CLAUDE.md — check root and .claude/
+    if [[ -f "$proj_dir/CLAUDE.md" ]]; then
+      lines=$(wc -l < "$proj_dir/CLAUDE.md")
+      has_claude="${G}${lines}L${N}"
+      has_claude=$(printf "%-6s" "$has_claude")
+    fi
+
+    # Memory files
+    memory_dir="$HOME/.claude/projects/-home-mchughson-1-Projects-${proj}/memory"
+    if [[ -d "$memory_dir" ]]; then
+      mcount=$(find "$memory_dir" -name "*.md" 2>/dev/null | wc -l)
+      if (( mcount > 0 )); then
+        has_memory="${G}${mcount}${N}   "
+      fi
+    fi
+
+    # Skills — check project-level .claude/skills/
+    if [[ -d "$proj_dir/.claude/skills" ]]; then
+      scount=$(find "$proj_dir/.claude/skills" -name "*.md" 2>/dev/null | wc -l)
+      if (( scount > 0 )); then
+        has_skills="${G}${scount}${N}  "
+      fi
+    fi
+
+    # Task Master
+    if [[ -f "$proj_dir/.taskmaster/tasks/tasks.json" ]]; then
+      has_tasks="${G}yes${N}"
+      has_tasks=$(printf "%-5s" "$has_tasks")
+    fi
+
+    # Git
+    if [[ -d "$proj_dir/.git" ]]; then
+      has_git="${G}yes${N}"
+    fi
+
+    printf "  %-22s %s %s %s %s %s\n" "$proj" "$has_claude" "$has_memory" "$has_skills" "$has_tasks" "$has_git"
+  done
+
+  # Global trim tabs
+  section "Global Trim Tabs"
+  if [[ -f "$HOME/.claude/CLAUDE.md" ]]; then
+    lines=$(wc -l < "$HOME/.claude/CLAUDE.md")
+    printf "  ${G}●${N} ~/.claude/CLAUDE.md          ${D}(%d lines)${N}\n" "$lines"
+  fi
+
+  global_memory="$HOME/.claude/projects/-home-mchughson-1-Projects/memory"
+  if [[ -d "$global_memory" ]]; then
+    mcount=$(find "$global_memory" -name "*.md" 2>/dev/null | wc -l)
+    printf "  ${G}●${N} Global memory files           ${D}(%d files)${N}\n" "$mcount"
+  fi
+
+  skill_count=$(find "$HOME/.claude/skills" -name "SKILL.md" 2>/dev/null | wc -l)
+  if (( skill_count > 0 )); then
+    printf "  ${G}●${N} Global skills                 ${D}(%d skills)${N}\n" "$skill_count"
+    while IFS= read -r skill_file; do
+      skill_name=$(basename "$(dirname "$skill_file")")
+      printf "    ${A}%s${N}\n" "$skill_name"
+    done < <(find "$HOME/.claude/skills" -name "SKILL.md" 2>/dev/null | sort)
+  fi
+}
+
+# ============================================================
+# GAPS — show projects missing key infrastructure
+# ============================================================
+cmd_gaps() {
+  section "Projects Missing Trim Tabs"
+
+  local missing_claude=()
+  local missing_git=()
+
+  for proj_dir in "$PROJECTS_DIR"/*/; do
+    [[ -d "$proj_dir" ]] || continue
+    proj=$(basename "$proj_dir")
+
+    # Skip non-code directories
+    [[ -d "$proj_dir/.git" ]] || [[ -f "$proj_dir/mix.exs" ]] || [[ -f "$proj_dir/package.json" ]] || continue
+
+    if [[ ! -f "$proj_dir/CLAUDE.md" ]]; then
+      missing_claude+=("$proj")
+    fi
+    if [[ ! -d "$proj_dir/.git" ]]; then
+      missing_git+=("$proj")
+    fi
+  done
+
+  if (( ${#missing_claude[@]} > 0 )); then
+    printf "  ${Y}No CLAUDE.md:${N}\n"
+    for p in "${missing_claude[@]}"; do
+      printf "    ${R}●${N} %s\n" "$p"
+    done
+  else
+    printf "  ${G}All code projects have CLAUDE.md${N}\n"
+  fi
+
+  if (( ${#missing_git[@]} > 0 )); then
+    printf "\n  ${Y}No git repo:${N}\n"
+    for p in "${missing_git[@]}"; do
+      printf "    ${R}●${N} %s\n" "$p"
+    done
+  fi
+}
+
+# ============================================================
+# DISPATCH
+# ============================================================
+case "$CMD" in
+  audit)  cmd_audit ;;
+  gaps)   cmd_gaps ;;
+  *)
+    echo "trimtab steer — manage trim tab infrastructure"
+    echo ""
+    echo "Usage: trimtab steer [command]"
+    echo ""
+    echo "Commands:"
+    echo "  audit    Show trim tab infrastructure across all projects (default)"
+    echo "  gaps     Show projects missing key infrastructure"
+    ;;
+esac

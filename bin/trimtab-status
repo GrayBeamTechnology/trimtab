@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# workstatus - Quick status of running work across projects
+# trimtab status - Quick status of running work across projects
 # Designed for phone-width SSH sessions (~60 chars)
 set -euo pipefail
 
