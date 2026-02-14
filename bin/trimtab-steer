@@ -201,11 +201,223 @@ cmd_gaps() {
 }
 
 # ============================================================
+# SYNC — extract and propagate lessons across projects
+# ============================================================
+cmd_sync() {
+  local use_ai=false
+  shift 2>/dev/null || true
+  for arg in "$@"; do
+    [[ "$arg" == "--ai" ]] && use_ai=true
+  done
+
+  section "Cross-Project Lesson Extraction"
+
+  # Collect all pitfalls, gotchas, known issues, and lessons from CLAUDE.md files
+  local all_lessons=""
+  local project_count=0
+  local lesson_count=0
+
+  for proj_dir in "$PROJECTS_DIR"/*/; do
+    [[ -d "$proj_dir" ]] || continue
+    local proj=$(basename "$proj_dir")
+    local claude_file="$proj_dir/CLAUDE.md"
+    [[ -f "$claude_file" ]] || continue
+
+    # Extract sections: Common Pitfalls, Known Issues, Critical Gotchas, Errors & Lessons
+    local extracted=""
+    extracted=$(awk '
+      /^##+ .*(Pitfall|Gotcha|Known Issue|Known Problem|Errors|Lesson|Regression|Warning)/ { capture=1; next }
+      /^##+ / { capture=0 }
+      capture && /^[[:space:]]*[-*]/ { print }
+    ' "$claude_file" 2>/dev/null)
+
+    if [[ -n "$extracted" ]]; then
+      local count
+      count=$(echo "$extracted" | wc -l)
+      lesson_count=$((lesson_count + count))
+      project_count=$((project_count + 1))
+      printf "  ${G}●${N} %-24s ${D}%d lessons${N}\n" "$proj" "$count"
+      all_lessons+="
+## ${proj}
+${extracted}
+"
+    fi
+  done
+
+  # Also extract from memory files
+  section "Memory File Lessons"
+  local memory_lessons=""
+
+  for memory_dir in "$HOME/.claude/projects/-home-mchughson-1-Projects-"*/memory/; do
+    [[ -d "$memory_dir" ]] || continue
+    local proj
+    proj=$(basename "$(dirname "$memory_dir")")
+    proj="${proj#-home-mchughson-1-Projects-}"
+
+    for md_file in "$memory_dir"*.md; do
+      [[ -f "$md_file" ]] || continue
+
+      local extracted=""
+      extracted=$(awk '
+        /^##+ .*(Lesson|Error|Pitfall|Mistake|Regression|Fix|Warning|Concern|Bug)/ { capture=1; next }
+        /^##+ / { capture=0 }
+        capture && /^[[:space:]]*[-*]/ { print }
+      ' "$md_file" 2>/dev/null)
+
+      if [[ -n "$extracted" ]]; then
+        local count
+        count=$(echo "$extracted" | wc -l)
+        lesson_count=$((lesson_count + count))
+        printf "  ${G}●${N} %-24s ${D}%d lessons${N}\n" "$proj/$(basename "$md_file")" "$count"
+        memory_lessons+="
+## ${proj} (memory)
+${extracted}
+"
+      fi
+    done
+  done
+
+  # Check what's already in global CLAUDE.md
+  local global_lessons=""
+  if [[ -f "$HOME/.claude/CLAUDE.md" ]]; then
+    global_lessons=$(awk '
+      /^##+ .*(Safe Deletion|Safe Process|Debug|Pushback|Enforcement|Pitfall|Lesson)/ { capture=1; next }
+      /^##+ / { capture=0 }
+      capture && /^[[:space:]]*[-*]/ { print }
+    ' "$HOME/.claude/CLAUDE.md" 2>/dev/null)
+  fi
+
+  local global_count=0
+  [[ -n "$global_lessons" ]] && global_count=$(echo "$global_lessons" | wc -l)
+
+  section "Summary"
+  printf "  ${D}Projects with documented lessons:${N} %d\n" "$project_count"
+  printf "  ${D}Total lessons extracted:${N}          %d\n" "$lesson_count"
+  printf "  ${D}Global CLAUDE.md rules:${N}           %d\n" "$global_count"
+
+  # Without --ai, just show the raw extraction
+  if ! $use_ai; then
+    if (( lesson_count > 0 )); then
+      section "All Extracted Lessons"
+      echo "$all_lessons" | while IFS= read -r line; do
+        if [[ "$line" =~ ^##\  ]]; then
+          printf "\n  ${C}%s${N}\n" "${line## }"
+        elif [[ -n "$line" ]]; then
+          printf "  %s\n" "$line"
+        fi
+      done
+      if [[ -n "$memory_lessons" ]]; then
+        echo "$memory_lessons" | while IFS= read -r line; do
+          if [[ "$line" =~ ^##\  ]]; then
+            printf "\n  ${C}%s${N}\n" "${line## }"
+          elif [[ -n "$line" ]]; then
+            printf "  %s\n" "$line"
+          fi
+        done
+      fi
+      printf "\n  ${D}Run 'trimtab steer sync --ai' for AI-powered pattern analysis${N}\n"
+    fi
+    return
+  fi
+
+  # ── AI-powered analysis ──
+  section "AI Pattern Analysis"
+  printf "  ${D}Analyzing %d lessons across %d projects...${N}\n" "$lesson_count" "$project_count"
+
+  # Find API key
+  local api_key=""
+  for env_file in "$PROJECTS_DIR/decision_forge_v2/.env" "$PROJECTS_DIR/ai-brand-studio/.env" "$HOME/.env"; do
+    if [[ -f "$env_file" ]]; then
+      api_key=$(grep "^OPENROUTER_API_KEY=" "$env_file" 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+      [[ -n "$api_key" ]] && break
+    fi
+  done
+
+  if [[ -z "$api_key" ]]; then
+    printf "  ${R}No OPENROUTER_API_KEY found${N}\n"
+    return 1
+  fi
+
+  local prompt="/no_think
+You are analyzing lessons learned and common pitfalls extracted from CLAUDE.md files and memory files across ${project_count} software projects.
+
+## Project Lessons
+${all_lessons}
+${memory_lessons}
+
+## Currently in Global CLAUDE.md
+${global_lessons}
+
+Your task:
+1. IDENTIFY cross-cutting patterns — lessons that appear in 2+ projects or apply universally
+2. FLAG lessons that are NOT yet in the global CLAUDE.md but should be
+3. DEDUPLICATE — merge similar lessons into concise rules
+4. CATEGORIZE as: [PROMOTE TO GLOBAL] [PROJECT-SPECIFIC] [ALREADY GLOBAL]
+
+Format your response as:
+
+### Promote to Global CLAUDE.md
+- [lesson] — appears in: [project1, project2]
+
+### Cross-Cutting Patterns
+- [pattern description] — affected projects: [list]
+
+### Project-Specific (leave in place)
+- [project]: [lesson summary]
+
+Be concise. Focus on actionable rules, not descriptions."
+
+  local payload
+  payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': 'qwen/qwen3-32b',
+    'messages': [{'role': 'user', 'content': sys.argv[1]}],
+    'max_tokens': 2000,
+    'temperature': 0.3
+}))
+" "$prompt")
+
+  local response
+  response=$(curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
+    -H "Authorization: Bearer $api_key" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null)
+
+  local content
+  content=$(echo "$response" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data['choices'][0]['message']['content'])
+except Exception as e:
+    print(f'Error parsing response: {e}')
+" 2>/dev/null)
+
+  if [[ -n "$content" ]]; then
+    printf "\n"
+    echo "$content" | while IFS= read -r line; do
+      if [[ "$line" =~ ^###\  ]]; then
+        printf "  ${B}${C}%s${N}\n" "$line"
+      elif [[ "$line" =~ ^-\  ]]; then
+        printf "  %s\n" "$line"
+      elif [[ -n "$line" ]]; then
+        printf "  ${D}%s${N}\n" "$line"
+      fi
+    done
+    printf "\n  ${D}Review above and add relevant items to ~/.claude/CLAUDE.md${N}\n"
+  else
+    printf "  ${R}Empty response from AI${N}\n"
+  fi
+}
+
+# ============================================================
 # DISPATCH
 # ============================================================
 case "$CMD" in
   audit)  cmd_audit ;;
   gaps)   cmd_gaps ;;
+  sync)   cmd_sync "$@" ;;
   *)
     echo "trimtab steer — manage trim tab infrastructure"
     echo ""
@@ -214,5 +426,6 @@ case "$CMD" in
     echo "Commands:"
     echo "  audit    Show trim tab infrastructure across all projects (default)"
     echo "  gaps     Show projects missing key infrastructure"
+    echo "  sync     Extract and propagate lessons across projects (--ai for analysis)"
     ;;
 esac
