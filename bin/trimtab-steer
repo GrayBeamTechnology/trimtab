@@ -153,6 +153,57 @@ cmd_gaps() {
     fi
   done
 
+  # Production readiness checks — only for projects with CI (they're production-bound)
+  local missing_release=()
+  local missing_health=()
+  local missing_deploy=()
+  local missing_backup=()
+  local missing_errortracking=()
+  local missing_envtemplate=()
+
+  for proj_dir in "$PROJECTS_DIR"/*/; do
+    [[ -d "$proj_dir" ]] || continue
+    proj=$(basename "$proj_dir")
+
+    # Only check projects that have CI
+    local has_ci=false
+    [[ -d "$proj_dir/.github/workflows" ]] && has_ci=true
+    [[ -f "$proj_dir/.gitlab-ci.yml" ]] && has_ci=true
+    $has_ci || continue
+
+    # Release module (Elixir-specific) — check root and server/ for monorepos
+    if [[ -f "$proj_dir/mix.exs" ]] || [[ -f "$proj_dir/server/mix.exs" ]]; then
+      if ! grep -rq "Release" "$proj_dir"/lib/*/release.ex "$proj_dir"/server/lib/*/release.ex 2>/dev/null; then
+        missing_release+=("$proj")
+      fi
+    fi
+
+    # Health endpoint — check lib/, server/lib/, src/ for monorepos
+    if ! grep -rq '/health\|/api/health' "$proj_dir/lib/" "$proj_dir/server/lib/" "$proj_dir/src/" 2>/dev/null; then
+      missing_health+=("$proj")
+    fi
+
+    # Deploy scripts
+    if [[ ! -d "$proj_dir/deploy" ]] && [[ ! -f "$proj_dir/graybeam.toml" ]]; then
+      missing_deploy+=("$proj")
+    fi
+
+    # Backup script
+    if [[ ! -f "$proj_dir/deploy/backup.sh" ]] && ! grep -q "backup" "$proj_dir/graybeam.toml" 2>/dev/null; then
+      missing_backup+=("$proj")
+    fi
+
+    # Error tracking — check root and subdirs for monorepos
+    if ! grep -rq 'sentry\|Sentry\|rollbar\|bugsnag' "$proj_dir/mix.exs" "$proj_dir/server/mix.exs" "$proj_dir/package.json" "$proj_dir/frontend/package.json" "$proj_dir/Cargo.toml" 2>/dev/null; then
+      missing_errortracking+=("$proj")
+    fi
+
+    # Env template
+    if [[ ! -f "$proj_dir/.env.example" ]] && [[ ! -f "$proj_dir/deploy/provision.sh" ]]; then
+      missing_envtemplate+=("$proj")
+    fi
+  done
+
   # Report each category
   if (( ${#missing_claude[@]} > 0 )); then
     printf "  ${Y}No CLAUDE.md:${N}\n"
@@ -190,12 +241,55 @@ cmd_gaps() {
     printf "\n"
   fi
 
+  # Production readiness report (only if any CI projects exist)
+  local prod_gaps=$(( ${#missing_release[@]} + ${#missing_health[@]} + ${#missing_deploy[@]} + ${#missing_backup[@]} + ${#missing_errortracking[@]} + ${#missing_envtemplate[@]} ))
+  if (( prod_gaps > 0 )); then
+    section "Production Readiness (projects with CI)"
+
+    if (( ${#missing_release[@]} > 0 )); then
+      printf "  ${Y}Elixir without Release module:${N}\n"
+      for p in "${missing_release[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+      printf "\n"
+    fi
+
+    if (( ${#missing_health[@]} > 0 )); then
+      printf "  ${Y}No health endpoint:${N}\n"
+      for p in "${missing_health[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+      printf "\n"
+    fi
+
+    if (( ${#missing_deploy[@]} > 0 )); then
+      printf "  ${Y}No deploy scripts:${N}\n"
+      for p in "${missing_deploy[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+      printf "\n"
+    fi
+
+    if (( ${#missing_backup[@]} > 0 )); then
+      printf "  ${Y}No backup script:${N}\n"
+      for p in "${missing_backup[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+      printf "\n"
+    fi
+
+    if (( ${#missing_errortracking[@]} > 0 )); then
+      printf "  ${Y}No error tracking:${N}\n"
+      for p in "${missing_errortracking[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+      printf "\n"
+    fi
+
+    if (( ${#missing_envtemplate[@]} > 0 )); then
+      printf "  ${Y}No .env template:${N}\n"
+      for p in "${missing_envtemplate[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+      printf "\n"
+    fi
+  fi
+
   # Summary
-  local total_gaps=$(( ${#missing_claude[@]} + ${#missing_hook[@]} + ${#missing_credo[@]} + ${#missing_precommit[@]} + ${#missing_ci[@]} ))
+  local total_gaps=$(( ${#missing_claude[@]} + ${#missing_hook[@]} + ${#missing_credo[@]} + ${#missing_precommit[@]} + ${#missing_ci[@]} + prod_gaps ))
   if (( total_gaps == 0 )); then
-    printf "  ${G}All projects have full quality infrastructure.${N}\n"
+    printf "  ${G}All projects have full quality and production infrastructure.${N}\n"
   else
-    printf "  ${D}Total gaps: %d across all categories${N}\n" "$total_gaps"
+    local dev_gaps=$(( ${#missing_claude[@]} + ${#missing_hook[@]} + ${#missing_credo[@]} + ${#missing_precommit[@]} + ${#missing_ci[@]} ))
+    printf "  ${D}Dev quality gaps: %d | Production readiness gaps: %d${N}\n" "$dev_gaps" "$prod_gaps"
     printf "  ${D}Fix with: trimtab init <project>${N}\n"
   fi
 }
