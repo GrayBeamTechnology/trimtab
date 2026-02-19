@@ -14,6 +14,8 @@ N=$'\033[0m'
 
 PROJECTS_DIR="$HOME/1-Projects"
 AGENT_SESSION="agents"
+AGENT_IMAGE="trimtab-agent"
+CONTAINER_PREFIX="agent-"
 
 # --- Remote hosts ---
 # Each entry: "alias|ssh_host|remote_projects_dir"
@@ -53,6 +55,34 @@ remote_tmux() {
 
 section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
 err() { printf "${R}error:${N} %s\n" "$1" >&2; exit 1; }
+
+# Build the podman run command for a given project
+# Usage: podman_run_cmd <projects_dir> <project> [selinux]
+podman_run_cmd() {
+  local projects="$1" project="$2" selinux="${3:-0}"
+  local vol_suffix=""
+  (( selinux )) && vol_suffix=":Z"
+
+  printf "podman run -it --rm --name %s%s --network host -v %s/.claude:/root/.claude%s -v %s/%s:/work%s %s -c claude" \
+    "$CONTAINER_PREFIX" "$project" \
+    "\$HOME" "$vol_suffix" \
+    "$projects" "$project" "$vol_suffix" \
+    "$AGENT_IMAGE"
+}
+
+# Detect if host uses SELinux (Fedora yes, NixOS no)
+detect_selinux() {
+  if [[ -f /etc/fedora-release ]]; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+detect_selinux_remote() {
+  local ssh_host="$1"
+  remote_cmd "$ssh_host" 'test -f /etc/fedora-release && echo 1 || echo 0' || echo 0
+}
 
 # ============================================================
 # DISCOVERY
@@ -348,17 +378,26 @@ spawn_local() {
   local proj_dir="$PROJECTS_DIR/$project"
   [[ -d "$proj_dir" ]] || err "project directory not found: $proj_dir"
 
+  # Check image exists
+  podman image exists "$AGENT_IMAGE" 2>/dev/null || \
+    err "image '$AGENT_IMAGE' not found. Build with: trimtab agent build"
+
+  local selinux
+  selinux=$(detect_selinux)
+  local run_cmd
+  run_cmd=$(podman_run_cmd "$PROJECTS_DIR" "$project" "$selinux")
+
   if ! tmux has-session -t "$AGENT_SESSION" 2>/dev/null; then
     tmux new-session -d -s "$AGENT_SESSION" -n "$project"
-    tmux send-keys -t "$AGENT_SESSION:$project" "cd '$proj_dir' && claude" Enter
-    printf "${G}created${N} session '%s' with window '%s'\n" "$AGENT_SESSION" "$project"
+    tmux send-keys -t "$AGENT_SESSION:$project" "$run_cmd" Enter
+    printf "${G}created${N} session '%s' with window '%s' ${D}(container)${N}\n" "$AGENT_SESSION" "$project"
   else
     if tmux list-windows -t "$AGENT_SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$project"; then
       printf "${Y}window '%s' already exists${N} — attaching\n" "$project"
     else
       tmux new-window -t "$AGENT_SESSION" -n "$project"
-      tmux send-keys -t "$AGENT_SESSION:$project" "cd '$proj_dir' && claude" Enter
-      printf "${G}created${N} window '%s' in session '%s'\n" "$project" "$AGENT_SESSION"
+      tmux send-keys -t "$AGENT_SESSION:$project" "$run_cmd" Enter
+      printf "${G}created${N} window '%s' in session '%s' ${D}(container)${N}\n" "$project" "$AGENT_SESSION"
     fi
   fi
 
@@ -390,6 +429,18 @@ spawn_remote() {
   remote_cmd "$ssh_host" "test -d '$remote_projects/$project'" || \
     err "project directory not found on $host_alias: $remote_projects/$project"
 
+  # Verify image exists on remote
+  remote_cmd "$ssh_host" "podman image exists $AGENT_IMAGE" 2>/dev/null || \
+    err "image '$AGENT_IMAGE' not found on $host_alias. Build with: trimtab agent build --on $host_alias"
+
+  local selinux
+  selinux=$(detect_selinux_remote "$ssh_host")
+
+  # Build the run command (expand $HOME on the remote side)
+  local vol_suffix=""
+  (( selinux )) && vol_suffix=":Z"
+  local run_cmd="podman run -it --rm --name ${CONTAINER_PREFIX}${project} --network host -v \\\$HOME/.claude:/root/.claude${vol_suffix} -v ${remote_projects}/${project}:/work${vol_suffix} ${AGENT_IMAGE} -c claude"
+
   # Check if window already exists
   local exists
   exists=$(remote_cmd "$ssh_host" "tmux list-windows -t $AGENT_SESSION -F '#{window_name}' 2>/dev/null" | grep -cx "$project") || exists=0
@@ -400,13 +451,13 @@ spawn_remote() {
     # Create session or window
     remote_cmd "$ssh_host" "
       if ! tmux has-session -t $AGENT_SESSION 2>/dev/null; then
-        tmux new-session -d -s $AGENT_SESSION -n '$project' -c '$remote_projects/$project'
+        tmux new-session -d -s $AGENT_SESSION -n '$project'
       else
-        tmux new-window -t $AGENT_SESSION -n '$project' -c '$remote_projects/$project'
+        tmux new-window -t $AGENT_SESSION -n '$project'
       fi
-      tmux send-keys -t $AGENT_SESSION:'$project' 'claude' Enter
+      tmux send-keys -t $AGENT_SESSION:'$project' '$run_cmd' Enter
     " || err "failed to create session on $host_alias"
-    printf "${G}created${N} window '%s' on %s (%s)\n" "$project" "$host_alias" "$ssh_host"
+    printf "${G}created${N} window '%s' on %s (%s) ${D}(container)${N}\n" "$project" "$host_alias" "$ssh_host"
   fi
 
   printf "\nTo attach: ${B}ssh -t %s 'tmux attach -t %s:%s'${N}\n" "$ssh_host" "$AGENT_SESSION" "$project"
@@ -518,6 +569,51 @@ cmd_broadcast() {
   done
 }
 
+cmd_build() {
+  local host_flag=""
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --on) host_flag="$2"; shift 2 ;;
+      *)    shift ;;
+    esac
+  done
+
+  local containerfile="$PROJECTS_DIR/trimtab/containers/agent/Containerfile"
+
+  if [[ -z "$host_flag" ]]; then
+    # Local build
+    [[ -f "$containerfile" ]] || err "Containerfile not found: $containerfile"
+    printf "${C}Building %s locally...${N}\n" "$AGENT_IMAGE"
+    podman build -t "$AGENT_IMAGE" "$(dirname "$containerfile")" || err "build failed"
+    ok "image $AGENT_IMAGE built"
+    podman images "$AGENT_IMAGE" --format "Size: {{.Size}}"
+  else
+    # Remote build
+    local ssh_host="" remote_projects=""
+    for entry in "${REMOTE_HOSTS[@]}"; do
+      parse_host "$entry"
+      if [[ "$HOST_ALIAS" == "$host_flag" ]]; then
+        ssh_host="$HOST_SSH"
+        remote_projects="$HOST_PROJECTS"
+        break
+      fi
+    done
+    [[ -z "$ssh_host" ]] && err "unknown host '$host_flag'. Check $HOSTS_FILE"
+
+    local remote_containerfile="$remote_projects/trimtab/containers/agent/Containerfile"
+    remote_cmd "$ssh_host" "test -f '$remote_containerfile'" || \
+      err "Containerfile not found on $host_flag: $remote_containerfile"
+
+    printf "${C}Building %s on %s...${N}\n" "$AGENT_IMAGE" "$host_flag"
+    ssh -o ConnectTimeout=5 "$ssh_host" \
+      "podman build -t $AGENT_IMAGE $(dirname "$remote_containerfile")" || err "build failed on $host_flag"
+    ok "image $AGENT_IMAGE built on $host_flag"
+  fi
+}
+
+ok() { printf "  ${G}✓${N} %s\n" "$1"; }
+
 # ============================================================
 # DISPATCH
 # ============================================================
@@ -528,6 +624,8 @@ shift 2>/dev/null || true
 case "$subcmd" in
   list|ls)       cmd_list "$@" ;;
   spawn)         cmd_spawn "$@" ;;
+  build)         cmd_build "$@" ;;
+  attach|a)      cmd_attach "$@" ;;
   peek)          cmd_peek "$@" ;;
   send)          cmd_send "$@" ;;
   broadcast|bc)  cmd_broadcast "$@" ;;
@@ -539,20 +637,25 @@ Usage: trimtab agent <command> [args...]
 
 Commands:
   list                                    Discover all Claude sessions (local + remote)
-  spawn [--on <host>] <project>           Launch Claude in a managed tmux window
+  spawn [--on <host>] <project>           Launch Claude in a container via tmux
+  build [--on <host>]                     Build the trimtab-agent container image
+  attach [host]                           Attach to the agents tmux session (local or remote)
   peek <project|host:project> [-n N] [-f] Capture recent pane output (default: 50 lines)
   send <project|host:project> <text>      Send keystrokes to an agent session
   broadcast <text>                        Send to all managed agent windows (with confirm)
 
-Aliases: ls=list, bc=broadcast
+Aliases: ls=list, a=attach, bc=broadcast
 
 Remote hosts configured in: ${HOSTS_FILE}
 Format: alias|ssh_host|remote_projects_dir (one per line)
 
 Examples:
   trimtab agent                                  # list all sessions (local + remote)
-  trimtab agent spawn gridplay-v1                # start locally
-  trimtab agent spawn --on thor gridplay-v1      # start on remote host
+  trimtab agent build                            # build container image locally
+  trimtab agent build --on thor                  # build on remote host
+  trimtab agent spawn gridplay-v1                # start locally (in container)
+  trimtab agent spawn --on thor gridplay-v1      # start on remote host (in container)
+  trimtab agent attach thor                      # attach to thor's agents session
   trimtab agent peek thor:gridplay-v1            # peek at remote session
   trimtab agent send thor:gridplay-v1 "/status"  # send to remote session
   trimtab agent broadcast "/compact"             # send to all agents everywhere

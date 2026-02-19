@@ -1,18 +1,20 @@
 # trimtab-agent — self-contained Claude Code + Elixir dev environment
-# Build: podman build -t trimtab-agent containers/agent/
-# Run:   podman run -it --network host \
-#          -v ~/.claude:/home/dev/.claude \
-#          -v ~/1-Projects/my-project:/work \
-#          trimtab-agent
+#
+# Build:  podman build -t trimtab-agent containers/agent/
+# Run:    podman run -it --network host \
+#           -v ~/.claude:/root/.claude:Z \
+#           -v ~/1-Projects/my-project:/work:Z \
+#           trimtab-agent -c 'claude'
+#
+# In rootless podman, container root = your host user (no privilege escalation).
+# Volume :Z suffix needed on Fedora (SELinux). Omit on NixOS.
 #
 # Versions pinned for reproducibility. Update and rebuild to upgrade.
 FROM docker.io/elixir:1.19-otp-28
 
 ARG NODE_MAJOR=24
-ARG DEV_USER=dev
-ARG DEV_UID=1000
 
-# --- System packages ---
+# --- System packages + GitHub CLI ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
@@ -27,6 +29,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gnupg \
     unzip \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Node.js LTS ---
@@ -43,19 +50,18 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
     && apt-get install -y --no-install-recommends postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Non-root user ---
-RUN useradd -m -s /bin/bash -u ${DEV_UID} ${DEV_USER} \
-    && echo "${DEV_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${DEV_USER}
-
-USER ${DEV_USER}
-WORKDIR /home/${DEV_USER}
-
 # --- Claude Code ---
-RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# --- Environment ---
+# PATH: claude lives in ~/.local/bin — must be set via ENV for non-interactive shells
+# TERM: Claude TUI needs a real terminal type
+# Auto-update: disabled — image pins the version, updates are lost on container restart
+ENV PATH="/root/.local/bin:${PATH}" \
+    TERM=xterm-256color \
+    CLAUDE_CODE_DISABLE_AUTO_UPDATE=1
 
 # --- Hex + Rebar (Elixir build tools) ---
-RUN /home/${DEV_USER}/.local/bin/claude --version || true
 RUN mix local.hex --force && mix local.rebar --force
 
 WORKDIR /work
