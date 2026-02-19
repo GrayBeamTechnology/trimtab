@@ -1,0 +1,153 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": "1",
+        "title": "Prepare nixos-thor project structure and clone repositories",
+        "description": "Set up the project directory structure on nixos-thor and clone all active projects with git remotes",
+        "details": "SSH into nixos-thor as user 'mac' and execute: mkdir -p ~/1-Projects. Then clone the following projects that have git remotes: gridplay-v1, uncle, ai-brand-studio, credentialvault, tallmadge, lessonledger, family_meetup, graybeam, trimtab. First verify which projects actually have git remotes by checking 'git remote -v' on fedora. Use commands like: cd ~/1-Projects && git clone <remote-url> <project-name>. Ensure proper directory permissions and ownership.",
+        "testStrategy": "Verify all cloned projects exist in ~/1-Projects on thor, each directory contains expected files, and git status shows clean working directory for each project.",
+        "priority": "high",
+        "dependencies": [],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:04:47.659Z"
+      },
+      {
+        "id": "2",
+        "title": "Copy shared Claude configuration to nixos-thor",
+        "description": "Transfer Claude global configuration files from fedora to nixos-thor",
+        "details": "Copy ~/.claude/CLAUDE.md and ~/.claude/settings.json from fedora (user mchughson) to thor (user mac). Use scp commands: scp ~/.claude/CLAUDE.md thor:~/.claude/ and scp ~/.claude/settings.json thor:~/.claude/. Ensure the ~/.claude directory exists on thor first with: ssh thor 'mkdir -p ~/.claude'. Verify file permissions are correct (readable by mac user).",
+        "testStrategy": "SSH into thor and verify both files exist with correct content: ls -la ~/.claude/ and cat ~/.claude/CLAUDE.md ~/.claude/settings.json. Compare checksums with fedora originals.",
+        "priority": "high",
+        "dependencies": [
+          "1"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:05:09.168Z"
+      },
+      {
+        "id": "3",
+        "title": "Verify Claude Code functionality on nixos-thor",
+        "description": "Test that Claude Code can authenticate and run properly on nixos-thor with project CLAUDE.md files",
+        "details": "SSH into thor and test Claude Code: cd ~/1-Projects/<test-project> && ~/.npm-global/bin/claude. Verify it authenticates successfully, can read the project's CLAUDE.md file, and responds to basic commands. Test with at least 2 different projects to ensure consistency. Check that Claude Code version 1.0.113 is working and credentials are properly configured.",
+        "testStrategy": "Successfully launch Claude in a project directory, send a test command like '/status' or '/help', verify it reads project-specific CLAUDE.md, and confirm authentication works without errors.",
+        "priority": "high",
+        "dependencies": [
+          "2"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:07:49.401Z"
+      },
+      {
+        "id": "4",
+        "title": "Create and test agents tmux session on nixos-thor",
+        "description": "Set up the tmux session structure for running multiple Claude agents on nixos-thor",
+        "details": "SSH into thor and create the agents tmux session: tmux new-session -d -s agents -n test-project. Test launching Claude inside tmux: tmux send-keys -t agents:test-project 'cd ~/1-Projects/<project> && ~/.npm-global/bin/claude' Enter. Verify tmux 3.4 works correctly and sessions persist. Test tmux commands: list-sessions, list-windows, capture-pane, send-keys.",
+        "testStrategy": "Verify tmux session 'agents' exists, can create windows, launch Claude inside windows, capture output with tmux capture-pane, and send commands with tmux send-keys. Session should persist across SSH disconnections.",
+        "priority": "high",
+        "dependencies": [
+          "3"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:14:03.790Z"
+      },
+      {
+        "id": "5",
+        "title": "Add host configuration to trimtab-agent",
+        "description": "Extend trimtab-agent script to support remote host configuration",
+        "details": "Add TRIMTAB_REMOTE_HOSTS variable to bin/trimtab-agent script. Start with hardcoded array: TRIMTAB_REMOTE_HOSTS=('thor'). Add helper functions: is_remote_host(), get_remote_user(), get_remote_projects_dir(). Map 'thor' to user 'mac' and projects dir '/home/mac/1-Projects'. Add error handling for SSH connectivity issues.",
+        "testStrategy": "Verify TRIMTAB_REMOTE_HOSTS array is properly defined, helper functions return correct values for thor (user=mac, projects_dir=/home/mac/1-Projects), and basic SSH connectivity test passes.",
+        "priority": "medium",
+        "dependencies": [
+          "4"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:19:20.401Z"
+      },
+      {
+        "id": "6",
+        "title": "Extend discover_agents() for remote host discovery",
+        "description": "Modify the agent discovery function to find tmux sessions on remote hosts via SSH",
+        "details": "Extend discover_agents() function to SSH into each remote host and run 'tmux list-panes -F \"#{session_name}:#{window_name}:#{pane_index}\"'. Add 'host' field to agent arrays. Remote agents display as 'thor:agents:0.0' in TARGET column. Implement SSH timeout handling (5-10 seconds) with graceful fallback. Use SSH ControlMaster for efficiency. Handle cases where tmux server isn't running on remote host.",
+        "testStrategy": "Run 'trimtab agent list' and verify it shows both local and remote agents. Remote agents should display with hostname prefix. Test with thor unreachable to verify graceful timeout handling.",
+        "priority": "medium",
+        "dependencies": [
+          "5"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:19:23.153Z"
+      },
+      {
+        "id": "7",
+        "title": "Implement remote spawn functionality",
+        "description": "Add --on <host> flag to spawn command for creating agents on remote hosts",
+        "details": "Add --on <host> flag parsing to spawn command. When specified: SSH into host, run 'tmux new-session -d -s agents 2>/dev/null || true' to ensure session exists, create named window with 'tmux new-window -t agents -n <project>', send 'cd ~/1-Projects/<project> && ~/.npm-global/bin/claude' Enter. Validate project directory exists on remote host first. If not in local tmux, print SSH attach instructions instead of attempting direct attach.",
+        "testStrategy": "Test 'trimtab agent spawn --on thor <project>' creates new window in agents session on thor, launches Claude successfully, and provides correct attach instructions when not in local tmux.",
+        "priority": "medium",
+        "dependencies": [
+          "6"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:19:25.943Z"
+      },
+      {
+        "id": "8",
+        "title": "Implement remote peek functionality",
+        "description": "Extend resolve_target() and peek command to support remote host:project syntax",
+        "details": "Modify resolve_target() to parse 'host:project' syntax (e.g., 'thor:gridplay-v1'). When remote target detected, wrap tmux capture-pane in SSH: 'ssh <host> \"tmux capture-pane -t agents:<project> -p -S -50\"'. For --follow flag, wrap with watch command: 'watch -n 1 \"ssh <host> \\\"tmux capture-pane -t agents:<project> -p -S -50\\\"\"'. Handle SSH connection failures gracefully.",
+        "testStrategy": "Test 'trimtab agent peek thor:<project>' shows remote session output, --follow flag updates in real-time, and error handling works when remote host/session doesn't exist.",
+        "priority": "medium",
+        "dependencies": [
+          "7"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:19:28.927Z"
+      },
+      {
+        "id": "9",
+        "title": "Implement remote send functionality",
+        "description": "Extend send command to work with remote targets using SSH-wrapped tmux commands",
+        "details": "Extend send command to handle remote targets resolved by resolve_target(). When target is remote, wrap tmux send-keys in SSH: 'ssh <host> \"tmux send-keys -t agents:<project> '<command>' Enter\"'. Display confirmation showing what command is being sent to which host:project. Maintain existing local send functionality unchanged.",
+        "testStrategy": "Test 'trimtab agent send thor:<project> \"/status\"' successfully sends command to remote session, displays confirmation message with host info, and command executes in remote Claude session.",
+        "priority": "medium",
+        "dependencies": [
+          "8"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:19:31.713Z"
+      },
+      {
+        "id": "10",
+        "title": "Implement remote broadcast functionality",
+        "description": "Extend broadcast command to include remote agents with efficient SSH reuse",
+        "details": "Modify broadcast command to include remote agents from discover_agents(). Group targets by host for efficient SSH reuse. For each remote host, build single SSH command that sends to multiple targets: 'ssh <host> \"tmux send-keys -t agents:<project1> '<cmd>' Enter; tmux send-keys -t agents:<project2> '<cmd>' Enter\"'. Update confirmation prompt to show both local and remote targets with host prefixes.",
+        "testStrategy": "Test broadcast command shows both local and remote targets in confirmation prompt, successfully sends commands to all agents across multiple hosts, and provides clear feedback about which hosts/projects received the broadcast.",
+        "priority": "medium",
+        "dependencies": [
+          "9"
+        ],
+        "status": "done",
+        "subtasks": [],
+        "updatedAt": "2026-02-16T06:19:34.446Z"
+      }
+    ],
+    "metadata": {
+      "version": "1.0.0",
+      "lastModified": "2026-02-16T06:19:34.447Z",
+      "taskCount": 10,
+      "completedCount": 10,
+      "tags": [
+        "master"
+      ]
+    }
+  }
+}

@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+# trimtab agent — manage Claude Code sessions via tmux (local + remote)
+# Usage: trimtab agent [list|spawn|peek|send|broadcast] [args...]
+set -euo pipefail
+
+# --- Colors ---
+R=$'\033[0;31m'
+G=$'\033[0;32m'
+D=$'\033[2m'
+B=$'\033[1m'
+C=$'\033[0;36m'
+Y=$'\033[0;33m'
+N=$'\033[0m'
+
+PROJECTS_DIR="$HOME/1-Projects"
+AGENT_SESSION="agents"
+
+# --- Remote hosts ---
+# Each entry: "alias|ssh_host|remote_projects_dir"
+HOSTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/trimtab/hosts"
+REMOTE_HOSTS=()
+
+load_remote_hosts() {
+  if [[ -f "$HOSTS_FILE" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      REMOTE_HOSTS+=("$line")
+    done < "$HOSTS_FILE"
+  fi
+}
+load_remote_hosts
+
+# Parse a host entry: "alias|ssh_host|remote_projects_dir"
+parse_host() {
+  local entry="$1"
+  HOST_ALIAS="${entry%%|*}"
+  local rest="${entry#*|}"
+  HOST_SSH="${rest%%|*}"
+  HOST_PROJECTS="${rest#*|}"
+}
+
+# Run a command on a remote host via SSH (timeout 5s for discovery)
+remote_cmd() {
+  local ssh_host="$1"; shift
+  ssh -o ConnectTimeout=3 -o BatchMode=yes "$ssh_host" "$@" 2>/dev/null
+}
+
+# Run tmux command on a remote host
+remote_tmux() {
+  local ssh_host="$1"; shift
+  remote_cmd "$ssh_host" "tmux $*"
+}
+
+section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
+err() { printf "${R}error:${N} %s\n" "$1" >&2; exit 1; }
+
+# ============================================================
+# DISCOVERY
+# ============================================================
+
+# Discover all Claude sessions (local + remote). Sets parallel arrays:
+#   AGENT_PROJECTS[], AGENT_TARGETS[], AGENT_ELAPSED[], AGENT_STATUSES[], AGENT_HOSTS[]
+discover_agents() {
+  AGENT_PROJECTS=()
+  AGENT_TARGETS=()
+  AGENT_ELAPSED=()
+  AGENT_STATUSES=()
+  AGENT_HOSTS=()
+
+  # --- Local discovery ---
+  discover_local
+
+  # --- Remote discovery ---
+  for entry in "${REMOTE_HOSTS[@]}"; do
+    parse_host "$entry"
+    discover_remote "$HOST_ALIAS" "$HOST_SSH"
+  done
+}
+
+discover_local() {
+  declare -A seen_pids=()
+
+  # Pass 1: local tmux panes
+  if tmux list-sessions &>/dev/null; then
+    while IFS='|' read -r target pane_pid cmd path wname; do
+      [[ -z "$pane_pid" ]] && continue
+      local claude_pid=""
+
+      if [[ "$cmd" == "claude" ]]; then
+        claude_pid="$pane_pid"
+      else
+        claude_pid=$(pgrep -P "$pane_pid" -x claude 2>/dev/null | head -1) || true
+      fi
+
+      [[ -z "$claude_pid" ]] && continue
+      seen_pids["$claude_pid"]=1
+
+      local project
+      project=$(basename "$path")
+      local elapsed
+      elapsed=$(ps -o etime= -p "$claude_pid" 2>/dev/null | xargs) || elapsed="?"
+
+      local session_name="${target%%:*}"
+      local status="tmux"
+      [[ "$session_name" != "$AGENT_SESSION" ]] && status="tmux (other)"
+
+      AGENT_PROJECTS+=("$project")
+      AGENT_TARGETS+=("$target")
+      AGENT_ELAPSED+=("$elapsed")
+      AGENT_STATUSES+=("$status")
+      AGENT_HOSTS+=("local")
+    done < <(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{window_name}" 2>/dev/null || true)
+  fi
+
+  # Pass 2: orphan local PIDs
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    [[ -n "${seen_pids[$pid]:-}" ]] && continue
+
+    local cwd project elapsed
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+    project=$(basename "$cwd")
+    elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs) || elapsed="?"
+
+    AGENT_PROJECTS+=("$project")
+    AGENT_TARGETS+=("—")
+    AGENT_ELAPSED+=("$elapsed")
+    AGENT_STATUSES+=("detached")
+    AGENT_HOSTS+=("local")
+  done < <(pgrep -x claude 2>/dev/null || true)
+}
+
+discover_remote() {
+  local alias="$1" ssh_host="$2"
+
+  # Single SSH call: get tmux panes + claude PIDs with elapsed times
+  local remote_data
+  remote_data=$(remote_cmd "$ssh_host" '
+    # tmux panes with claude detection
+    if tmux list-sessions 2>/dev/null >&2; then
+      tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{window_name}" 2>/dev/null | while IFS="|" read -r target pane_pid cmd path wname; do
+        claude_pid=""
+        if [ "$cmd" = "claude" ]; then
+          claude_pid="$pane_pid"
+        else
+          claude_pid=$(pgrep -P "$pane_pid" -x claude 2>/dev/null | head -1) || true
+        fi
+        [ -z "$claude_pid" ] && continue
+        elapsed=$(ps -o etime= -p "$claude_pid" 2>/dev/null | xargs) || elapsed="?"
+        echo "TMUX|$target|$(basename "$path")|$elapsed"
+      done
+    fi
+    # Orphan PIDs (not in tmux)
+    for pid in $(pgrep -x claude 2>/dev/null); do
+      cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+      echo "PID|$pid|$(basename "$cwd")|$(ps -o etime= -p "$pid" 2>/dev/null | xargs)"
+    done
+  ') || { printf "  ${D}%s: unreachable${N}\n" "$alias" >&2; return; }
+
+  [[ -z "$remote_data" ]] && return
+
+  declare -A remote_tmux_pids=()
+
+  # First pass: tmux entries
+  while IFS='|' read -r type target project elapsed; do
+    [[ "$type" != "TMUX" ]] && continue
+    remote_tmux_pids["$project"]=1
+
+    local session_name="${target%%:*}"
+    local status="tmux"
+    [[ "$session_name" != "$AGENT_SESSION" ]] && status="tmux (other)"
+
+    AGENT_PROJECTS+=("$project")
+    AGENT_TARGETS+=("${alias}:${target}")
+    AGENT_ELAPSED+=("$elapsed")
+    AGENT_STATUSES+=("$status")
+    AGENT_HOSTS+=("$alias")
+  done <<< "$remote_data"
+
+  # Second pass: orphan PIDs
+  while IFS='|' read -r type pid project elapsed; do
+    [[ "$type" != "PID" ]] && continue
+    [[ -n "${remote_tmux_pids[$project]:-}" ]] && continue
+
+    AGENT_PROJECTS+=("$project")
+    AGENT_TARGETS+=("—")
+    AGENT_ELAPSED+=("$elapsed")
+    AGENT_STATUSES+=("detached ($alias)")
+    AGENT_HOSTS+=("$alias")
+  done <<< "$remote_data"
+}
+
+# Resolve "host:project", "project", or direct tmux target to (host, tmux_target).
+# Sets: RESOLVED_HOST, RESOLVED_TARGET, RESOLVED_SSH
+resolve_target() {
+  local input="$1"
+  RESOLVED_HOST=""
+  RESOLVED_TARGET=""
+  RESOLVED_SSH=""
+
+  # Check for "host:project" syntax (host alias followed by colon and project name)
+  # Distinguish from tmux targets like "session:window.pane" by checking against known hosts
+  local maybe_host="${input%%:*}"
+  local maybe_rest="${input#*:}"
+
+  for entry in "${REMOTE_HOSTS[@]}"; do
+    parse_host "$entry"
+    if [[ "$maybe_host" == "$HOST_ALIAS" && -n "$maybe_rest" ]]; then
+      # It's host:project or host:tmux_target
+      RESOLVED_HOST="$HOST_ALIAS"
+      RESOLVED_SSH="$HOST_SSH"
+
+      # If rest contains ":" it's a full tmux target (host:session:window.pane)
+      if [[ "$maybe_rest" == *:* ]]; then
+        RESOLVED_TARGET="$maybe_rest"
+        return
+      fi
+
+      # Otherwise resolve project name on that host
+      resolve_remote_project "$HOST_ALIAS" "$HOST_SSH" "$maybe_rest"
+      return
+    fi
+  done
+
+  # Not a remote host prefix — resolve locally
+  RESOLVED_HOST="local"
+
+  # Direct local tmux target (contains ":")
+  if [[ "$input" == *:* ]]; then
+    if tmux display-message -t "$input" -p "#{pane_id}" &>/dev/null; then
+      RESOLVED_TARGET="$input"
+      return
+    fi
+    err "tmux target '$input' not found"
+  fi
+
+  # Look up by project name across all discovered agents
+  discover_agents
+  local match_indices=()
+  for i in "${!AGENT_PROJECTS[@]}"; do
+    if [[ "${AGENT_PROJECTS[$i]}" == "$input" && "${AGENT_TARGETS[$i]}" != "—" ]]; then
+      match_indices+=("$i")
+    fi
+  done
+
+  if (( ${#match_indices[@]} == 0 )); then
+    printf "${R}error:${N} no tmux agent session for '%s'\n" "$input" >&2
+    if (( ${#AGENT_PROJECTS[@]} > 0 )); then
+      printf "Running agents: %s\n" "$(printf '%s, ' "${AGENT_PROJECTS[@]}" | sed 's/, $//')" >&2
+    fi
+    exit 1
+  fi
+
+  if (( ${#match_indices[@]} == 1 )); then
+    local idx="${match_indices[0]}"
+    RESOLVED_HOST="${AGENT_HOSTS[$idx]}"
+    RESOLVED_TARGET="${AGENT_TARGETS[$idx]}"
+    # Set SSH host if remote
+    if [[ "$RESOLVED_HOST" != "local" ]]; then
+      for entry in "${REMOTE_HOSTS[@]}"; do
+        parse_host "$entry"
+        [[ "$HOST_ALIAS" == "$RESOLVED_HOST" ]] && RESOLVED_SSH="$HOST_SSH"
+      done
+    fi
+    return
+  fi
+
+  # Multiple matches — tell user to disambiguate
+  printf "${R}error:${N} multiple sessions for '%s' — disambiguate with host:project:\n" "$input" >&2
+  for idx in "${match_indices[@]}"; do
+    printf "  %s:%s  (%s)\n" "${AGENT_HOSTS[$idx]}" "${AGENT_PROJECTS[$idx]}" "${AGENT_TARGETS[$idx]}" >&2
+  done
+  exit 1
+}
+
+resolve_remote_project() {
+  local alias="$1" ssh_host="$2" project="$3"
+
+  local target
+  target=$(remote_cmd "$ssh_host" "
+    if tmux list-sessions 2>/dev/null >&2; then
+      tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null | while IFS='|' read -r t ppid cmd path; do
+        claude_pid=''
+        if [ \"\$cmd\" = 'claude' ]; then
+          claude_pid=\"\$ppid\"
+        else
+          claude_pid=\$(pgrep -P \"\$ppid\" -x claude 2>/dev/null | head -1) || true
+        fi
+        [ -z \"\$claude_pid\" ] && continue
+        proj=\$(basename \"\$path\")
+        [ \"\$proj\" = '$project' ] && echo \"\$t\" && exit 0
+      done
+    fi
+  ") || true
+
+  if [[ -z "$target" ]]; then
+    err "no agent session for '$project' on $alias"
+  fi
+
+  RESOLVED_TARGET="$target"
+}
+
+# ============================================================
+# SUBCOMMANDS
+# ============================================================
+
+cmd_list() {
+  discover_agents
+
+  section "Agent Sessions"
+
+  if (( ${#AGENT_PROJECTS[@]} == 0 )); then
+    printf "  ${D}none${N}\n"
+    printf "\n  Launch one with: ${B}trimtab agent spawn <project>${N}\n"
+    return
+  fi
+
+  printf "  ${D}%-22s %-24s %-12s %s${N}\n" "PROJECT" "TARGET" "ELAPSED" "STATUS"
+  for i in "${!AGENT_PROJECTS[@]}"; do
+    local status_color="$G"
+    [[ "${AGENT_STATUSES[$i]}" == *"detached"* ]] && status_color="$Y"
+    printf "  %-22s %-24s %-12s ${status_color}%s${N}\n" \
+      "${AGENT_PROJECTS[$i]}" "${AGENT_TARGETS[$i]}" "${AGENT_ELAPSED[$i]}" "${AGENT_STATUSES[$i]}"
+  done
+}
+
+cmd_spawn() {
+  local project="" host_flag=""
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --on) host_flag="$2"; shift 2 ;;
+      *)    project="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$project" ]] && err "usage: trimtab agent spawn [--on <host>] <project>"
+
+  if [[ -n "$host_flag" ]]; then
+    spawn_remote "$host_flag" "$project"
+  else
+    spawn_local "$project"
+  fi
+}
+
+spawn_local() {
+  local project="$1"
+  local proj_dir="$PROJECTS_DIR/$project"
+  [[ -d "$proj_dir" ]] || err "project directory not found: $proj_dir"
+
+  if ! tmux has-session -t "$AGENT_SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$AGENT_SESSION" -n "$project"
+    tmux send-keys -t "$AGENT_SESSION:$project" "cd '$proj_dir' && claude" Enter
+    printf "${G}created${N} session '%s' with window '%s'\n" "$AGENT_SESSION" "$project"
+  else
+    if tmux list-windows -t "$AGENT_SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$project"; then
+      printf "${Y}window '%s' already exists${N} — attaching\n" "$project"
+    else
+      tmux new-window -t "$AGENT_SESSION" -n "$project"
+      tmux send-keys -t "$AGENT_SESSION:$project" "cd '$proj_dir' && claude" Enter
+      printf "${G}created${N} window '%s' in session '%s'\n" "$project" "$AGENT_SESSION"
+    fi
+  fi
+
+  if [[ -z "${TMUX:-}" ]]; then
+    exec tmux attach-session -t "$AGENT_SESSION:$project"
+  else
+    tmux select-window -t "$AGENT_SESSION:$project"
+    printf "switched to window '%s'\n" "$project"
+  fi
+}
+
+spawn_remote() {
+  local host_alias="$1" project="$2"
+  local ssh_host="" remote_projects=""
+
+  # Find host config
+  for entry in "${REMOTE_HOSTS[@]}"; do
+    parse_host "$entry"
+    if [[ "$HOST_ALIAS" == "$host_alias" ]]; then
+      ssh_host="$HOST_SSH"
+      remote_projects="$HOST_PROJECTS"
+      break
+    fi
+  done
+
+  [[ -z "$ssh_host" ]] && err "unknown host '$host_alias'. Check $HOSTS_FILE"
+
+  # Verify project directory exists on remote
+  remote_cmd "$ssh_host" "test -d '$remote_projects/$project'" || \
+    err "project directory not found on $host_alias: $remote_projects/$project"
+
+  # Check if window already exists
+  local exists
+  exists=$(remote_cmd "$ssh_host" "tmux list-windows -t $AGENT_SESSION -F '#{window_name}' 2>/dev/null" | grep -cx "$project") || exists=0
+
+  if (( exists > 0 )); then
+    printf "${Y}window '%s' already exists on %s${N}\n" "$project" "$host_alias"
+  else
+    # Create session or window
+    remote_cmd "$ssh_host" "
+      if ! tmux has-session -t $AGENT_SESSION 2>/dev/null; then
+        tmux new-session -d -s $AGENT_SESSION -n '$project' -c '$remote_projects/$project'
+      else
+        tmux new-window -t $AGENT_SESSION -n '$project' -c '$remote_projects/$project'
+      fi
+      tmux send-keys -t $AGENT_SESSION:'$project' 'claude' Enter
+    " || err "failed to create session on $host_alias"
+    printf "${G}created${N} window '%s' on %s (%s)\n" "$project" "$host_alias" "$ssh_host"
+  fi
+
+  printf "\nTo attach: ${B}ssh -t %s 'tmux attach -t %s:%s'${N}\n" "$ssh_host" "$AGENT_SESSION" "$project"
+}
+
+cmd_peek() {
+  local lines=50
+  local follow=0
+  local target_input=""
+
+  while (( $# > 0 )); do
+    case "$1" in
+      -n|--lines) lines="$2"; shift 2 ;;
+      -f|--follow) follow=1; shift ;;
+      *) target_input="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$target_input" ]] && err "usage: trimtab agent peek <project|host:project> [-n lines] [-f]"
+
+  resolve_target "$target_input"
+
+  if [[ "$RESOLVED_HOST" == "local" ]]; then
+    if (( follow )); then
+      exec watch -n 1 "tmux capture-pane -t '$RESOLVED_TARGET' -p -S -$lines"
+    else
+      tmux capture-pane -t "$RESOLVED_TARGET" -p -S "-$lines"
+    fi
+  else
+    if (( follow )); then
+      exec watch -n 1 "ssh -o ConnectTimeout=3 -o BatchMode=yes '$RESOLVED_SSH' 'tmux capture-pane -t \"$RESOLVED_TARGET\" -p -S -$lines'"
+    else
+      remote_cmd "$RESOLVED_SSH" "tmux capture-pane -t '$RESOLVED_TARGET' -p -S -$lines"
+    fi
+  fi
+}
+
+cmd_send() {
+  local target_input="${1:-}"
+  shift || true
+  local text="$*"
+
+  [[ -z "$target_input" ]] && err "usage: trimtab agent send <project|host:project> <text>"
+  [[ -z "$text" ]] && err "usage: trimtab agent send <project|host:project> <text>"
+
+  resolve_target "$target_input"
+
+  if [[ "$RESOLVED_HOST" == "local" ]]; then
+    printf "${D}sending to %s (%s):${N} %s\n" "$target_input" "$RESOLVED_TARGET" "$text"
+    tmux send-keys -t "$RESOLVED_TARGET" "$text" Enter
+  else
+    printf "${D}sending to %s on %s (%s):${N} %s\n" "$target_input" "$RESOLVED_HOST" "$RESOLVED_TARGET" "$text"
+    remote_cmd "$RESOLVED_SSH" "tmux send-keys -t '$RESOLVED_TARGET' '$text' Enter"
+  fi
+}
+
+cmd_broadcast() {
+  local text="$*"
+  [[ -z "$text" ]] && err "usage: trimtab agent broadcast <text>"
+
+  discover_agents
+
+  # Collect all tmux-accessible targets
+  local targets=()
+  local projects=()
+  local hosts=()
+  for i in "${!AGENT_PROJECTS[@]}"; do
+    [[ "${AGENT_TARGETS[$i]}" == "—" ]] && continue
+    targets+=("${AGENT_TARGETS[$i]}")
+    projects+=("${AGENT_PROJECTS[$i]}")
+    hosts+=("${AGENT_HOSTS[$i]}")
+  done
+
+  if (( ${#targets[@]} == 0 )); then
+    err "no tmux agent sessions found"
+  fi
+
+  printf "Will send to ${B}%d${N} agents:\n" "${#targets[@]}"
+  for i in "${!targets[@]}"; do
+    if [[ "${hosts[$i]}" == "local" ]]; then
+      printf "  %s  (%s)\n" "${projects[$i]}" "${targets[$i]}"
+    else
+      printf "  %s  (%s) ${D}[%s]${N}\n" "${projects[$i]}" "${targets[$i]}" "${hosts[$i]}"
+    fi
+  done
+  printf "Text: ${B}%s${N}\n" "$text"
+
+  read -rp "Send? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "cancelled"; exit 0; }
+
+  for i in "${!targets[@]}"; do
+    local t="${targets[$i]}"
+    local h="${hosts[$i]}"
+
+    if [[ "$h" == "local" ]]; then
+      tmux send-keys -t "$t" "$text" Enter
+    else
+      # Remote target format: "alias:session:window.pane" → tmux target is "session:window.pane"
+      local alias="${t%%:*}"
+      local tmux_target="${t#*:}"
+      local ssh_host=""
+      for entry in "${REMOTE_HOSTS[@]}"; do
+        parse_host "$entry"
+        [[ "$HOST_ALIAS" == "$alias" ]] && ssh_host="$HOST_SSH" && break
+      done
+      remote_cmd "$ssh_host" "tmux send-keys -t '$tmux_target' '$text' Enter"
+    fi
+    printf "  ${G}sent${N} → %s %s\n" "${projects[$i]}" "${D}[${h}]${N}"
+  done
+}
+
+# ============================================================
+# DISPATCH
+# ============================================================
+
+subcmd="${1:-list}"
+shift 2>/dev/null || true
+
+case "$subcmd" in
+  list|ls)       cmd_list "$@" ;;
+  spawn)         cmd_spawn "$@" ;;
+  peek)          cmd_peek "$@" ;;
+  send)          cmd_send "$@" ;;
+  broadcast|bc)  cmd_broadcast "$@" ;;
+  help|-h|--help)
+    cat <<EOF
+trimtab agent — manage Claude Code sessions via tmux (local + remote)
+
+Usage: trimtab agent <command> [args...]
+
+Commands:
+  list                                    Discover all Claude sessions (local + remote)
+  spawn [--on <host>] <project>           Launch Claude in a managed tmux window
+  peek <project|host:project> [-n N] [-f] Capture recent pane output (default: 50 lines)
+  send <project|host:project> <text>      Send keystrokes to an agent session
+  broadcast <text>                        Send to all managed agent windows (with confirm)
+
+Aliases: ls=list, bc=broadcast
+
+Remote hosts configured in: ${HOSTS_FILE}
+Format: alias|ssh_host|remote_projects_dir (one per line)
+
+Examples:
+  trimtab agent                                  # list all sessions (local + remote)
+  trimtab agent spawn gridplay-v1                # start locally
+  trimtab agent spawn --on thor gridplay-v1      # start on remote host
+  trimtab agent peek thor:gridplay-v1            # peek at remote session
+  trimtab agent send thor:gridplay-v1 "/status"  # send to remote session
+  trimtab agent broadcast "/compact"             # send to all agents everywhere
+EOF
+    ;;
+  *)
+    err "unknown subcommand '$subcmd'. Run 'trimtab agent help' for usage."
+    ;;
+esac

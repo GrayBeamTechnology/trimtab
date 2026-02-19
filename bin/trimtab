@@ -27,6 +27,7 @@ Usage: ${SELF} <command> [args...]
 Commands:
   status    Dev environment status (phone-friendly, <3s)
   dash      Persistent tmux dashboard
+  agent     Manage Claude Code sessions via tmux (local + remote)
   observe   Cross-project briefing (what happened since you last looked)
   steer     Audit trim tab infrastructure across projects
   init      Bootstrap trim tab config for a project

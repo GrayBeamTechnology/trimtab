@@ -1,0 +1,24 @@
+// Syncthing ignore patterns for Elixir/Node projects
+// Build artifacts — machine-specific, reproducible from source
+node_modules
+_build
+deps
+.elixir_ls
+_deps
+.fetch
+
+// IDE/editor state
+.idea
+*.swp
+*.swo
+*~
+
+// Git — exclude entirely, use git push/pull to move commits between machines
+// Syncing .git causes index/lock conflicts on every multi-file commit
+.git
+*.sync-conflict-*
+*.sync-tmp
+
+// OS files
+.DS_Store
+Thumbs.db

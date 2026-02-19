@@ -1,0 +1,74 @@
+# PRD: trimtab Multi-Host Agent Management
+
+## Overview
+
+Extend trimtab's agent session management to support running Claude Code sessions on remote always-on servers, accessible from any machine on the Tailscale network (laptop, phone, other servers). The primary target is nixos-thor, which already has Claude Code, Node.js, tmux, and git installed.
+
+## Problem
+
+All Claude Code sessions currently run on Mike's Fedora laptop. When the laptop sleeps or travels, sessions become unreachable. There's no way to run persistent, always-on agent sessions that survive workstation downtime.
+
+## Architecture Decisions (Already Made)
+
+These decisions were researched and confirmed. Do not re-derive them.
+
+- **Target machine: nixos-thor** (not nixos-jedi). Thor already has Claude Code installed, Node.js 20, tmux 3.4, git, 62GB RAM, dual GPUs (RTX 3090 + A6000), SSH multiplexing configured from fedora. Jedi has none of this tooling.
+- **Multi-host strategy: SSH transparent proxy**. trimtab-agent on fedora wraps tmux commands in SSH when targeting remote hosts. No need to install trimtab on thor. ~60 lines of bash added to existing script.
+- **File sync: Git clone first, Syncthing later**. Start by cloning active projects on thor via git. Add Syncthing as a follow-up for real-time sync if manual pull feels too slow.
+- **Phone access: Direct SSH to thor + tmux attach**. No additional tooling needed for mobile monitoring.
+- **Username mapping: fedora=mchughson, thor=mac**. Paths differ between machines. Each machine maintains its own ~/.claude/ state. CLAUDE.md files inside repos are the shared source of truth.
+
+## Scope
+
+### Phase 1: Thor Preparation (Infrastructure)
+
+Prepare nixos-thor to run Claude Code agent sessions.
+
+1. **Create project structure on thor**: `mkdir -p ~/1-Projects` on thor, clone the active projects that have git remotes (gridplay-v1, uncle, ai-brand-studio, credentialvault, tallmadge, lessonledger, family_meetup, graybeam, trimtab — verify which have remotes first).
+2. **Copy shared Claude config**: Copy `~/.claude/CLAUDE.md` and `~/.claude/settings.json` from fedora to thor. These contain the global development instructions.
+3. **Verify Claude Code works on thor**: SSH into thor, cd into a project, launch claude in tmux, confirm it authenticates and can read the project's CLAUDE.md.
+4. **Create agents tmux session on thor**: Manually test `tmux new-session -d -s agents -n test-project` and launching claude inside it.
+
+### Phase 2: Multi-Host trimtab-agent
+
+Extend `bin/trimtab-agent` to discover, spawn, peek, send, and broadcast across SSH to remote hosts.
+
+1. **Add host configuration**: Define `TRIMTAB_REMOTE_HOSTS` — either as a variable in the script or read from `~/.config/trimtab/hosts`. Start simple (hardcoded array), make configurable later if needed.
+2. **Remote discovery in list**: Extend `discover_agents()` to SSH into each remote host and run tmux list-panes. Add a "host" field to the agent arrays. Remote agents show their hostname in the TARGET column (e.g., `thor:agents:0.0`). Handle SSH timeouts gracefully (remote host unreachable → skip with warning, don't block).
+3. **Remote spawn**: Add `--on <host>` flag to `spawn`. When specified: SSH into the host, create/verify the agents tmux session, create a named window, send `cd ~/1-Projects/$project && claude` Enter. Validate the project directory exists on the remote host before launching. If not in tmux locally, print instructions instead of trying to attach (can't attach to a remote tmux from the local terminal directly).
+4. **Remote peek**: Extend `resolve_target()` to understand `host:project` syntax (e.g., `thor:gridplay-v1`). When a remote target is resolved, wrap `tmux capture-pane` in SSH. The `--follow` flag should work by wrapping `watch` around the SSH command.
+5. **Remote send**: Same pattern — resolve target, wrap `tmux send-keys` in SSH. Show what's being sent and to which host.
+6. **Remote broadcast**: Extend broadcast to include remote agents. Group by host for efficient SSH reuse. Confirmation prompt should show both local and remote targets.
+
+### Phase 3: Syncthing File Sync (Follow-up)
+
+Set up real-time bidirectional file sync between fedora and thor for active projects. This is a follow-up task, not required for Phase 1-2.
+
+1. **Install Syncthing on both machines**: On thor via NixOS configuration.nix (`services.syncthing`), on fedora via dnf.
+2. **Configure shared folders**: Share active project directories. Use `.stignore` to exclude `node_modules`, `_build`, `deps`, `.elixir_ls`, `_deps`.
+3. **Test sync**: Verify files sync within seconds over Tailscale. Test the "laptop sleeps, wakes, queued changes sync" flow.
+4. **Document the setup**: Add sync info to trimtab README or internal docs.
+
+## Non-Goals
+
+- Do not set up nixos-jedi (no tooling installed, not worth the NixOS rebuild for MVP)
+- Do not build a service registry or discovery protocol (SSH + bash array is sufficient for 2-3 machines)
+- Do not try to sync ~/.claude/ project state between machines (absolute paths differ, let each machine maintain its own)
+- Do not add a web UI or API — this is a CLI tool accessed via SSH
+- Do not add container orchestration — tmux sessions are the right abstraction
+
+## Technical Notes
+
+- SSH ControlMaster is already configured from fedora to thor with 10-minute persist. SSH overhead is negligible.
+- Thor's SSH user is `mac`, fedora's is `mchughson`. The remote PROJECTS_DIR will be `/home/mac/1-Projects`.
+- Thor already has Claude Code at `~/.npm-global/bin/claude` (version 1.0.113) with credentials present.
+- All tmux commands work over SSH without being inside tmux locally. `ssh thor 'tmux capture-pane -t agents:gridplay-v1 -p -S -50'` is the full remote peek implementation.
+
+## Success Criteria
+
+- `trimtab agent list` shows sessions on both fedora and thor
+- `trimtab agent spawn --on thor <project>` launches a Claude session on thor
+- `trimtab agent peek thor:<project>` shows output from thor
+- `trimtab agent send thor:<project> "/status"` sends a command to a session on thor
+- Sessions on thor persist when fedora laptop sleeps
+- Phone can SSH to thor and attach to the agents tmux session
