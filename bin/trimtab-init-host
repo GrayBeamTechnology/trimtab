@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+# trimtab init-host — bootstrap a remote machine as a trimtab agent host
+# Usage: trimtab init-host <alias> <ssh_host>
+#
+# Idempotent: safe to re-run. Checks before acting at every step.
+set -euo pipefail
+
+# --- Colors ---
+R=$'\033[0;31m'
+G=$'\033[0;32m'
+D=$'\033[2m'
+B=$'\033[1m'
+C=$'\033[0;36m'
+Y=$'\033[0;33m'
+N=$'\033[0m'
+
+PROJECTS_DIR="$HOME/1-Projects"
+HOSTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/trimtab/hosts"
+STIGNORE_SRC="$PROJECTS_DIR/trimtab/.stignore"
+
+err() { printf "${R}error:${N} %s\n" "$1" >&2; exit 1; }
+ok()  { printf "  ${G}✓${N} %s\n" "$1"; }
+skip(){ printf "  ${D}· %s (already done)${N}\n" "$1"; }
+info(){ printf "  ${C}…${N} %s\n" "$1"; }
+warn(){ printf "  ${Y}!${N} %s\n" "$1"; }
+
+remote() { ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" "$@"; }
+
+usage() {
+  cat <<EOF
+trimtab init-host — bootstrap a remote machine as a trimtab agent host
+
+Usage: trimtab init-host <alias> <ssh_host>
+
+Example:
+  trimtab init-host jedi nixos-jedi
+
+Steps performed (all idempotent):
+  1. Validate SSH access + passwordless sudo
+  2. Detect OS (NixOS / Fedora / generic Linux)
+  3. Install system packages (git, tmux, podman)
+  4. Enable nix-ld (NixOS only — needed for dynamically linked binaries)
+  5. Install Claude Code
+  6. Copy Claude config (~/.claude/CLAUDE.md, settings.json, hooks)
+  7. Clone active projects to ~/1-Projects/
+  8. Configure Syncthing (pair devices, share project folders)
+  9. Register host in trimtab hosts file
+
+Remote hosts file: ${HOSTS_FILE}
+EOF
+  exit 0
+}
+
+# --- Args ---
+[[ "${1:-}" =~ ^(-h|--help|help)$ ]] && usage
+ALIAS="${1:-}"
+SSH_HOST="${2:-}"
+[[ -z "$ALIAS" || -z "$SSH_HOST" ]] && err "usage: trimtab init-host <alias> <ssh_host>"
+
+NIXOS_REBUILD_NEEDED=0
+
+printf "\n${B}${C}── Bootstrapping %s (%s)${N}\n\n" "$ALIAS" "$SSH_HOST"
+
+# ============================================================
+# Step 1: Validate SSH access
+# ============================================================
+
+REMOTE_USER=$(remote 'whoami' 2>/dev/null) || err "SSH connection failed. Check: ssh $SSH_HOST"
+ok "SSH access (${REMOTE_USER}@${SSH_HOST})"
+
+remote 'sudo -n echo ok' &>/dev/null || err "Passwordless sudo not configured on $SSH_HOST"
+ok "Passwordless sudo"
+
+REMOTE_PROJECTS="/home/${REMOTE_USER}/1-Projects"
+
+# ============================================================
+# Step 2: Detect OS
+# ============================================================
+
+OS_TYPE=$(remote 'if [ -f /etc/NIXOS ]; then echo nixos; elif [ -f /etc/fedora-release ]; then echo fedora; else echo linux; fi')
+ok "${OS_TYPE} detected"
+
+# ============================================================
+# Step 3: System packages (git, tmux)
+# ============================================================
+
+REQUIRED_PKGS=(git tmux podman)
+
+install_packages_nixos() {
+  local missing=()
+  for pkg in "${REQUIRED_PKGS[@]}"; do
+    remote "which $pkg" &>/dev/null || missing+=("$pkg")
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    skip "${REQUIRED_PKGS[*]} installed"
+    return
+  fi
+
+  info "Adding ${missing[*]} to configuration.nix..."
+  for pkg in "${missing[@]}"; do
+    remote "grep -q '^\s*${pkg}\$' /etc/nixos/configuration.nix" 2>/dev/null && continue
+    remote "sudo sed -i '/environment.systemPackages = with pkgs; \[/a\\    ${pkg}' /etc/nixos/configuration.nix"
+  done
+  NIXOS_REBUILD_NEEDED=1
+  ok "Packages added to configuration.nix: ${missing[*]}"
+}
+
+install_packages_fedora() {
+  local missing=()
+  for pkg in "${REQUIRED_PKGS[@]}"; do
+    remote "which $pkg" &>/dev/null || missing+=("$pkg")
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    skip "${REQUIRED_PKGS[*]} installed"
+    return
+  fi
+
+  info "Installing ${missing[*]}..."
+  remote "sudo dnf install -y ${missing[*]}" || err "Failed to install packages"
+  ok "git, tmux installed"
+}
+
+case "$OS_TYPE" in
+  nixos)  install_packages_nixos ;;
+  fedora) install_packages_fedora ;;
+  *)
+    for pkg in "${REQUIRED_PKGS[@]}"; do
+      remote "which $pkg" &>/dev/null || err "$pkg not found on $SSH_HOST — install manually"
+    done
+    skip "${REQUIRED_PKGS[*]} installed"
+    ;;
+esac
+
+# ============================================================
+# Step 4: nix-ld (NixOS only)
+# ============================================================
+
+if [[ "$OS_TYPE" == "nixos" ]]; then
+  if remote 'grep -q "nix-ld" /etc/nixos/configuration.nix' 2>/dev/null; then
+    skip "nix-ld enabled"
+  else
+    info "Enabling nix-ld in configuration.nix..."
+    # Insert before the closing } of the configuration
+    remote "sudo sed -i '/^}$/i\\  programs.nix-ld.enable = true;' /etc/nixos/configuration.nix"
+    NIXOS_REBUILD_NEEDED=1
+    ok "nix-ld enabled"
+  fi
+
+  # Syncthing service
+  if remote 'grep -q "syncthing" /etc/nixos/configuration.nix' 2>/dev/null; then
+    skip "Syncthing service configured"
+  else
+    info "Adding Syncthing service to configuration.nix..."
+    remote "sudo sed -i '/^}$/i\\  services.syncthing = {\n    enable = true;\n    user = \"${REMOTE_USER}\";\n    dataDir = \"/home/${REMOTE_USER}\";\n    configDir = \"/home/${REMOTE_USER}/.config/syncthing\";\n  };' /etc/nixos/configuration.nix"
+    NIXOS_REBUILD_NEEDED=1
+    ok "Syncthing service added"
+  fi
+
+  # Rebuild if anything changed
+  if (( NIXOS_REBUILD_NEEDED )); then
+    info "Running nixos-rebuild switch..."
+    remote 'sudo nixos-rebuild switch' 2>&1 | tail -3
+    ok "nixos-rebuild switch complete"
+    NIXOS_REBUILD_NEEDED=0
+    # Verify packages are now available
+    remote 'which git' &>/dev/null || err "git still not available after rebuild"
+    remote 'which tmux' &>/dev/null || err "tmux still not available after rebuild"
+    ok "git, tmux verified"
+  fi
+fi
+
+# ============================================================
+# Step 5: Install Claude Code
+# ============================================================
+
+REMOTE_CLAUDE_VER=$(remote 'export PATH="$HOME/.local/bin:$PATH"; claude --version 2>/dev/null || echo missing')
+if [[ "$REMOTE_CLAUDE_VER" == "missing" ]]; then
+  info "Installing Claude Code..."
+  remote 'curl -fsSL https://claude.ai/install.sh | bash' || err "Claude Code install failed"
+  REMOTE_CLAUDE_VER=$(remote 'export PATH="$HOME/.local/bin:$PATH"; claude --version 2>/dev/null || echo unknown')
+  ok "Claude Code ${REMOTE_CLAUDE_VER} installed"
+else
+  skip "Claude Code ${REMOTE_CLAUDE_VER} installed"
+fi
+
+# Ensure ~/.local/bin is in PATH for future sessions (needed for claude, npm, etc.)
+remote 'grep -q "/.local/bin" ~/.bashrc 2>/dev/null || echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
+
+# ============================================================
+# Step 6: Copy Claude config
+# ============================================================
+
+# Ensure ~/.claude directory exists
+remote "mkdir -p ~/.claude/hooks"
+
+# rsync CLAUDE.md
+if [[ -f "$HOME/.claude/CLAUDE.md" ]]; then
+  rsync -c "$HOME/.claude/CLAUDE.md" "${SSH_HOST}:~/.claude/CLAUDE.md"
+  ok "Claude CLAUDE.md copied"
+fi
+
+# rsync settings.json
+if [[ -f "$HOME/.claude/settings.json" ]]; then
+  rsync -c "$HOME/.claude/settings.json" "${SSH_HOST}:~/.claude/settings.json"
+  ok "Claude settings.json copied"
+fi
+
+# rsync hooks directory
+if [[ -d "$HOME/.claude/hooks" ]]; then
+  rsync -a --delete "$HOME/.claude/hooks/" "${SSH_HOST}:~/.claude/hooks/"
+  ok "Claude hooks copied"
+fi
+
+# ============================================================
+# Step 7: Git credentials (before cloning — needed for private repos)
+# ============================================================
+
+if [[ -f "$HOME/.git-credentials" ]]; then
+  rsync -c "$HOME/.git-credentials" "${SSH_HOST}:~/.git-credentials"
+  remote "git config --global credential.helper store"
+  ok "Git credentials configured"
+fi
+
+# Copy .gitconfig basics (name, email)
+local_name=$(git config --global user.name 2>/dev/null || true)
+local_email=$(git config --global user.email 2>/dev/null || true)
+if [[ -n "$local_name" ]]; then
+  remote "git config --global user.name '$local_name'"
+fi
+if [[ -n "$local_email" ]]; then
+  remote "git config --global user.email '$local_email'"
+fi
+skip "Git config synced"
+
+# ============================================================
+# Step 8: Clone active projects
+# ============================================================
+
+remote "mkdir -p '$REMOTE_PROJECTS'"
+
+# Build list of projects to sync (those with git remotes on fedora)
+CLONE_COUNT=0
+SKIP_COUNT=0
+FAIL_COUNT=0
+
+for dir in "$PROJECTS_DIR"/*/; do
+  project=$(basename "$dir")
+  remote_url=$(git -C "$dir" remote get-url origin 2>/dev/null) || continue
+
+  # Skip SSH-only remotes (require SSH keys, not git-credentials)
+  if [[ "$remote_url" == git@* ]]; then
+    continue
+  fi
+
+  if remote "test -d '$REMOTE_PROJECTS/$project'" 2>/dev/null; then
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+  else
+    info "Cloning $project..."
+    remote "git clone '$remote_url' '$REMOTE_PROJECTS/$project'" 2>/dev/null || {
+      warn "Failed to clone $project ($remote_url) — skipping"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+      continue
+    }
+    CLONE_COUNT=$((CLONE_COUNT + 1))
+  fi
+done
+
+if (( CLONE_COUNT > 0 )); then
+  ok "${CLONE_COUNT} projects cloned"
+fi
+if (( SKIP_COUNT > 0 )); then
+  skip "${SKIP_COUNT} projects already present"
+fi
+if (( FAIL_COUNT > 0 )); then
+  warn "${FAIL_COUNT} projects failed to clone (check credentials)"
+fi
+
+# ============================================================
+# Step 9: Syncthing
+# ============================================================
+
+configure_syncthing() {
+  # Find local Syncthing API
+  local local_config=""
+  for path in "$HOME/.local/state/syncthing/config.xml" "$HOME/.config/syncthing/config.xml"; do
+    [[ -f "$path" ]] && local_config="$path" && break
+  done
+  [[ -z "$local_config" ]] && { warn "Local Syncthing config not found — skipping Syncthing setup"; return; }
+
+  local local_apikey
+  local_apikey=$(grep -oP '<apikey>\K[^<]+' "$local_config")
+  local local_port="8384"
+
+  # Wait for Syncthing to be running on the remote (may have just started via nixos-rebuild)
+  local st_up=0
+  for attempt in 1 2 3 4 5; do
+    if remote 'curl -sf -o /dev/null -w "%{http_code}" http://127.0.0.1:8384/ 2>/dev/null' | grep -qE "200|401|403"; then
+      st_up=1
+      break
+    fi
+    (( attempt < 5 )) && { info "Waiting for Syncthing to start (attempt $attempt/5)..."; sleep 3; }
+  done
+  if (( ! st_up )); then
+    warn "Syncthing not running on $SSH_HOST — skipping Syncthing setup"
+    warn "Start Syncthing, then re-run: trimtab init-host $ALIAS $SSH_HOST"
+    return
+  fi
+
+  # Get remote Syncthing API key
+  local remote_config
+  remote_config=$(remote 'cat ~/.local/state/syncthing/config.xml 2>/dev/null || cat ~/.config/syncthing/config.xml 2>/dev/null || echo ""')
+  if [[ -z "$remote_config" ]]; then
+    # NixOS often puts config in a different location
+    remote_config=$(remote 'cat /home/'"$REMOTE_USER"'/.config/syncthing/config.xml 2>/dev/null || cat /var/lib/syncthing/.config/syncthing/config.xml 2>/dev/null || echo ""')
+  fi
+  if [[ -z "$remote_config" ]]; then
+    warn "Cannot find Syncthing config on $SSH_HOST — skipping Syncthing setup"
+    return
+  fi
+
+  local remote_apikey
+  remote_apikey=$(echo "$remote_config" | grep -oP '<apikey>\K[^<]+')
+
+  # Get device IDs
+  local local_device_id
+  local_device_id=$(curl -sf "http://127.0.0.1:${local_port}/rest/system/status" \
+    -H "X-API-Key: ${local_apikey}" | grep -oP '"myID"\s*:\s*"\K[^"]+')
+
+  local remote_device_id
+  remote_device_id=$(remote "curl -sf 'http://127.0.0.1:8384/rest/system/status' -H 'X-API-Key: ${remote_apikey}'" | grep -oP '"myID"\s*:\s*"\K[^"]+')
+
+  if [[ -z "$local_device_id" || -z "$remote_device_id" ]]; then
+    warn "Could not get Syncthing device IDs — skipping pairing"
+    return
+  fi
+
+  # Add remote device to local Syncthing (if not already known)
+  local known_devices
+  known_devices=$(curl -sf "http://127.0.0.1:${local_port}/rest/config/devices" \
+    -H "X-API-Key: ${local_apikey}")
+  if echo "$known_devices" | grep -q "$remote_device_id"; then
+    skip "Remote device already known to local Syncthing"
+  else
+    info "Adding $ALIAS to local Syncthing..."
+    curl -sf "http://127.0.0.1:${local_port}/rest/config/devices" \
+      -H "X-API-Key: ${local_apikey}" \
+      -H "Content-Type: application/json" \
+      -d "{\"deviceID\":\"${remote_device_id}\",\"name\":\"${SSH_HOST}\",\"addresses\":[\"dynamic\"],\"compression\":\"metadata\",\"introducer\":false}"
+    ok "Remote device added to local Syncthing"
+  fi
+
+  # Add local device to remote Syncthing (if not already known)
+  local remote_known
+  remote_known=$(remote "curl -sf 'http://127.0.0.1:8384/rest/config/devices' -H 'X-API-Key: ${remote_apikey}'")
+  if echo "$remote_known" | grep -q "$local_device_id"; then
+    skip "Local device already known to remote Syncthing"
+  else
+    info "Adding fedora to remote Syncthing..."
+    remote "curl -sf 'http://127.0.0.1:8384/rest/config/devices' \
+      -H 'X-API-Key: ${remote_apikey}' \
+      -H 'Content-Type: application/json' \
+      -d '{\"deviceID\":\"${local_device_id}\",\"name\":\"fedora\",\"addresses\":[\"dynamic\"],\"compression\":\"metadata\",\"introducer\":false}'"
+    ok "Local device added to remote Syncthing"
+  fi
+
+  # Share project folders — use same folders as currently synced to thor
+  local synced_folders=()
+  while IFS= read -r folder_id; do
+    [[ "$folder_id" == proj-* ]] || continue
+    synced_folders+=("$folder_id")
+  done < <(grep -oP 'folder id="\K[^"]+' "$local_config")
+
+  local folder_count=0
+  for folder_id in "${synced_folders[@]}"; do
+    local project="${folder_id#proj-}"
+
+    # Check if remote device is already shared on this folder locally
+    local folder_config
+    folder_config=$(curl -sf "http://127.0.0.1:${local_port}/rest/config/folders/${folder_id}" \
+      -H "X-API-Key: ${local_apikey}" 2>/dev/null) || continue
+
+    if echo "$folder_config" | grep -q "$remote_device_id"; then
+      continue  # already shared
+    fi
+
+    # Add the remote device to this folder's device list (local side)
+    # We need to PATCH the folder config to add the device
+    local devices_json
+    devices_json=$(echo "$folder_config" | python3 -c "
+import sys, json
+cfg = json.load(sys.stdin)
+cfg['devices'].append({'deviceID': '${remote_device_id}', 'introducedBy': '', 'encryptionPassword': ''})
+json.dump(cfg, sys.stdout)
+" 2>/dev/null) || continue
+
+    curl -sf -X PUT "http://127.0.0.1:${local_port}/rest/config/folders/${folder_id}" \
+      -H "X-API-Key: ${local_apikey}" \
+      -H "Content-Type: application/json" \
+      -d "$devices_json" >/dev/null
+
+    # Create folder on remote side
+    remote "curl -sf -X POST 'http://127.0.0.1:8384/rest/config/folders' \
+      -H 'X-API-Key: ${remote_apikey}' \
+      -H 'Content-Type: application/json' \
+      -d '{\"id\":\"${folder_id}\",\"label\":\"${project}\",\"path\":\"${REMOTE_PROJECTS}/${project}\",\"type\":\"sendreceive\",\"rescanIntervalS\":30,\"fsWatcherEnabled\":true,\"devices\":[{\"deviceID\":\"${remote_device_id}\"},{\"deviceID\":\"${local_device_id}\"}]}'" 2>/dev/null || true
+
+    folder_count=$((folder_count + 1))
+  done
+
+  if (( folder_count > 0 )); then
+    ok "Syncthing: ${folder_count} folders shared with $ALIAS"
+  else
+    skip "Syncthing folders already shared"
+  fi
+
+  # Deploy .stignore to remote projects
+  if [[ -f "$STIGNORE_SRC" ]]; then
+    local stignore_count=0
+    for folder_id in "${synced_folders[@]}"; do
+      local project="${folder_id#proj-}"
+      rsync -c "$STIGNORE_SRC" "${SSH_HOST}:${REMOTE_PROJECTS}/${project}/.stignore" 2>/dev/null && \
+        stignore_count=$((stignore_count + 1)) || true
+    done
+    if (( stignore_count > 0 )); then
+      ok ".stignore deployed to ${stignore_count} projects"
+    fi
+  fi
+}
+
+configure_syncthing
+
+# ============================================================
+# Step 10: Register in trimtab hosts
+# ============================================================
+
+mkdir -p "$(dirname "$HOSTS_FILE")"
+
+if [[ -f "$HOSTS_FILE" ]] && grep -q "^${ALIAS}|" "$HOSTS_FILE"; then
+  skip "Registered in ${HOSTS_FILE}"
+else
+  echo "${ALIAS}|${SSH_HOST}|${REMOTE_PROJECTS}" >> "$HOSTS_FILE"
+  ok "Registered in ${HOSTS_FILE}"
+fi
+
+# ============================================================
+# Done
+# ============================================================
+
+printf "\n  ${G}${B}%s is ready.${N} Try: ${B}trimtab agent spawn --on %s <project>${N}\n\n" "$ALIAS" "$ALIAS"

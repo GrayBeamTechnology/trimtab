@@ -31,6 +31,7 @@ Commands:
   observe   Cross-project briefing (what happened since you last looked)
   steer     Audit trim tab infrastructure across projects
   init      Bootstrap trim tab config for a project
+  init-host Bootstrap a remote machine as an agent host
 
 https://trimtab.dev
 EOF
