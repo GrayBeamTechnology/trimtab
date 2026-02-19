@@ -38,13 +38,12 @@ Example:
 Steps performed (all idempotent):
   1. Validate SSH access + passwordless sudo
   2. Detect OS (NixOS / Fedora / generic Linux)
-  3. Install system packages (git, tmux, podman)
-  4. Enable nix-ld (NixOS only — needed for dynamically linked binaries)
-  5. Install Claude Code
-  6. Copy Claude config (~/.claude/CLAUDE.md, settings.json, hooks)
-  7. Clone active projects to ~/1-Projects/
-  8. Configure Syncthing (pair devices, share project folders)
-  9. Register host in trimtab hosts file
+  3. Install packages + deploy trimtab.nix module (NixOS)
+  4. Install Claude Code
+  5. Copy Claude config (~/.claude/CLAUDE.md, settings.json, hooks)
+  6. Clone active projects to ~/1-Projects/
+  7. Configure Syncthing (pair devices, share project folders)
+  8. Register host in trimtab hosts file
 
 Remote hosts file: ${HOSTS_FILE}
 EOF
@@ -81,29 +80,62 @@ OS_TYPE=$(remote 'if [ -f /etc/NIXOS ]; then echo nixos; elif [ -f /etc/fedora-r
 ok "${OS_TYPE} detected"
 
 # ============================================================
-# Step 3: System packages (git, tmux)
+# Step 3: System packages + NixOS module
 # ============================================================
 
 REQUIRED_PKGS=(git tmux podman)
+TRIMTAB_NIX_SRC="$PROJECTS_DIR/trimtab/containers/nixos/trimtab.nix"
 
-install_packages_nixos() {
-  local missing=()
-  for pkg in "${REQUIRED_PKGS[@]}"; do
-    remote "which $pkg" &>/dev/null || missing+=("$pkg")
-  done
-
-  if (( ${#missing[@]} == 0 )); then
-    skip "${REQUIRED_PKGS[*]} installed"
-    return
+install_nixos() {
+  # Deploy trimtab.nix module (idempotent — rsync only copies if changed)
+  if [[ -f "$TRIMTAB_NIX_SRC" ]]; then
+    rsync -c "$TRIMTAB_NIX_SRC" "${SSH_HOST}:/tmp/trimtab.nix"
+    remote "sudo cp /tmp/trimtab.nix /etc/nixos/trimtab.nix && rm /tmp/trimtab.nix"
+    ok "trimtab.nix deployed to /etc/nixos/"
+  else
+    warn "trimtab.nix not found at $TRIMTAB_NIX_SRC — skipping module deploy"
   fi
 
-  info "Adding ${missing[*]} to configuration.nix..."
-  for pkg in "${missing[@]}"; do
-    remote "grep -q '^\s*${pkg}\$' /etc/nixos/configuration.nix" 2>/dev/null && continue
-    remote "sudo sed -i '/environment.systemPackages = with pkgs; \[/a\\    ${pkg}' /etc/nixos/configuration.nix"
-  done
-  NIXOS_REBUILD_NEEDED=1
-  ok "Packages added to configuration.nix: ${missing[*]}"
+  # Add import to configuration.nix (if not already present)
+  if remote 'grep -q "trimtab.nix" /etc/nixos/configuration.nix' 2>/dev/null; then
+    skip "trimtab.nix already imported"
+  else
+    info "Adding trimtab.nix to imports..."
+    remote "sudo sed -i 's|imports = \[|imports = [ ./trimtab.nix|' /etc/nixos/configuration.nix"
+    NIXOS_REBUILD_NEEDED=1
+    ok "trimtab.nix added to imports"
+  fi
+
+  # Set Syncthing user/paths per-host (module enables the service, we configure user here)
+  if remote 'grep -q "syncthing.user" /etc/nixos/configuration.nix' 2>/dev/null; then
+    skip "Syncthing user configured"
+  else
+    info "Adding Syncthing user config..."
+    remote "sudo sed -i '/^}$/i\\  services.syncthing.user = \"${REMOTE_USER}\";\n  services.syncthing.dataDir = \"/home/${REMOTE_USER}\";\n  services.syncthing.configDir = \"/home/${REMOTE_USER}/.config/syncthing\";' /etc/nixos/configuration.nix"
+    NIXOS_REBUILD_NEEDED=1
+    ok "Syncthing user configured"
+  fi
+
+  # Rebuild if anything changed
+  if (( NIXOS_REBUILD_NEEDED )); then
+    info "Running nixos-rebuild switch..."
+    remote 'sudo nixos-rebuild switch' 2>&1 | tail -3
+    ok "nixos-rebuild switch complete"
+    NIXOS_REBUILD_NEEDED=0
+    remote 'which git' &>/dev/null || err "git still not available after rebuild"
+    remote 'which tmux' &>/dev/null || err "tmux still not available after rebuild"
+    ok "Packages verified"
+  else
+    local missing=()
+    for pkg in "${REQUIRED_PKGS[@]}"; do
+      remote "which $pkg" &>/dev/null || missing+=("$pkg")
+    done
+    if (( ${#missing[@]} > 0 )); then
+      warn "Missing packages: ${missing[*]} — run nixos-rebuild switch on $SSH_HOST"
+    else
+      skip "Packages installed"
+    fi
+  fi
 }
 
 install_packages_fedora() {
@@ -123,7 +155,7 @@ install_packages_fedora() {
 }
 
 case "$OS_TYPE" in
-  nixos)  install_packages_nixos ;;
+  nixos)  install_nixos ;;
   fedora) install_packages_fedora ;;
   *)
     for pkg in "${REQUIRED_PKGS[@]}"; do
@@ -134,45 +166,7 @@ case "$OS_TYPE" in
 esac
 
 # ============================================================
-# Step 4: nix-ld (NixOS only)
-# ============================================================
-
-if [[ "$OS_TYPE" == "nixos" ]]; then
-  if remote 'grep -q "nix-ld" /etc/nixos/configuration.nix' 2>/dev/null; then
-    skip "nix-ld enabled"
-  else
-    info "Enabling nix-ld in configuration.nix..."
-    # Insert before the closing } of the configuration
-    remote "sudo sed -i '/^}$/i\\  programs.nix-ld.enable = true;' /etc/nixos/configuration.nix"
-    NIXOS_REBUILD_NEEDED=1
-    ok "nix-ld enabled"
-  fi
-
-  # Syncthing service
-  if remote 'grep -q "syncthing" /etc/nixos/configuration.nix' 2>/dev/null; then
-    skip "Syncthing service configured"
-  else
-    info "Adding Syncthing service to configuration.nix..."
-    remote "sudo sed -i '/^}$/i\\  services.syncthing = {\n    enable = true;\n    user = \"${REMOTE_USER}\";\n    dataDir = \"/home/${REMOTE_USER}\";\n    configDir = \"/home/${REMOTE_USER}/.config/syncthing\";\n  };' /etc/nixos/configuration.nix"
-    NIXOS_REBUILD_NEEDED=1
-    ok "Syncthing service added"
-  fi
-
-  # Rebuild if anything changed
-  if (( NIXOS_REBUILD_NEEDED )); then
-    info "Running nixos-rebuild switch..."
-    remote 'sudo nixos-rebuild switch' 2>&1 | tail -3
-    ok "nixos-rebuild switch complete"
-    NIXOS_REBUILD_NEEDED=0
-    # Verify packages are now available
-    remote 'which git' &>/dev/null || err "git still not available after rebuild"
-    remote 'which tmux' &>/dev/null || err "tmux still not available after rebuild"
-    ok "git, tmux verified"
-  fi
-fi
-
-# ============================================================
-# Step 5: Install Claude Code
+# Step 4: Install Claude Code
 # ============================================================
 
 REMOTE_CLAUDE_VER=$(remote 'export PATH="$HOME/.local/bin:$PATH"; claude --version 2>/dev/null || echo missing')
@@ -189,7 +183,7 @@ fi
 remote 'grep -q "/.local/bin" ~/.bashrc 2>/dev/null || echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
 
 # ============================================================
-# Step 6: Copy Claude config
+# Step 5: Copy Claude config
 # ============================================================
 
 # Ensure ~/.claude directory exists
@@ -221,7 +215,7 @@ if [[ -d "$HOME/.claude/hooks" ]]; then
 fi
 
 # ============================================================
-# Step 7: Git credentials (before cloning — needed for private repos)
+# Step 6: Git credentials (before cloning — needed for private repos)
 # ============================================================
 
 if [[ -f "$HOME/.git-credentials" ]]; then
@@ -242,7 +236,7 @@ fi
 skip "Git config synced"
 
 # ============================================================
-# Step 8: Clone active projects
+# Step 7: Clone active projects
 # ============================================================
 
 remote "mkdir -p '$REMOTE_PROJECTS'"
@@ -285,7 +279,7 @@ if (( FAIL_COUNT > 0 )); then
 fi
 
 # ============================================================
-# Step 9: Syncthing
+# Step 8: Syncthing
 # ============================================================
 
 configure_syncthing() {
@@ -439,7 +433,7 @@ json.dump(cfg, sys.stdout)
 configure_syncthing
 
 # ============================================================
-# Step 10: Register in trimtab hosts
+# Step 9: Register in trimtab hosts
 # ============================================================
 
 mkdir -p "$(dirname "$HOSTS_FILE")"

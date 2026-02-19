@@ -108,9 +108,34 @@ discover_agents() {
 }
 
 discover_local() {
-  declare -A seen_pids=()
+  declare -A seen_projects=()
 
-  # Pass 1: local tmux panes
+  # Pass 1: agent containers (podman)
+  while IFS='|' read -r cname running_for; do
+    [[ -z "$cname" ]] && continue
+    local project="${cname#"$CONTAINER_PREFIX"}"
+    seen_projects["$project"]=1
+
+    # Find matching tmux target by window name
+    local target="—"
+    if tmux list-sessions &>/dev/null; then
+      target=$(tmux list-windows -a -F "#{session_name}:#{window_index}|#{window_name}" 2>/dev/null \
+        | grep "|${project}$" | head -1 | cut -d'|' -f1) || target="—"
+      [[ -z "$target" ]] && target="—"
+    fi
+
+    local session_name="${target%%:*}"
+    local status="container"
+    [[ "$target" != "—" && "$session_name" != "$AGENT_SESSION" ]] && status="container (other)"
+
+    AGENT_PROJECTS+=("$project")
+    AGENT_TARGETS+=("$target")
+    AGENT_ELAPSED+=("$running_for")
+    AGENT_STATUSES+=("$status")
+    AGENT_HOSTS+=("local")
+  done < <(podman ps --filter "name=${CONTAINER_PREFIX}" --format '{{.Names}}|{{.RunningFor}}' 2>/dev/null || true)
+
+  # Pass 2: bare claude processes in tmux panes (non-containerized)
   if tmux list-sessions &>/dev/null; then
     while IFS='|' read -r target pane_pid cmd path wname; do
       [[ -z "$pane_pid" ]] && continue
@@ -123,10 +148,13 @@ discover_local() {
       fi
 
       [[ -z "$claude_pid" ]] && continue
-      seen_pids["$claude_pid"]=1
 
       local project
       project=$(basename "$path")
+      # Skip if already found as a container
+      [[ -n "${seen_projects[$project]:-}" ]] && continue
+      seen_projects["$project"]=1
+
       local elapsed
       elapsed=$(ps -o etime= -p "$claude_pid" 2>/dev/null | xargs) || elapsed="?"
 
@@ -142,14 +170,15 @@ discover_local() {
     done < <(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{window_name}" 2>/dev/null || true)
   fi
 
-  # Pass 2: orphan local PIDs
+  # Pass 3: orphan bare claude PIDs (not in tmux, not in containers)
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
-    [[ -n "${seen_pids[$pid]:-}" ]] && continue
 
     local cwd project elapsed
     cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
     project=$(basename "$cwd")
+    [[ -n "${seen_projects[$project]:-}" ]] && continue
+
     elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs) || elapsed="?"
 
     AGENT_PROJECTS+=("$project")
@@ -162,12 +191,19 @@ discover_local() {
 
 discover_remote() {
   local alias="$1" ssh_host="$2"
+  local prefix="$CONTAINER_PREFIX"
 
-  # Single SSH call: get tmux panes + claude PIDs with elapsed times
+  # Single SSH call: get containers + tmux panes + bare claude PIDs
   local remote_data
   remote_data=$(remote_cmd "$ssh_host" '
-    # tmux panes with claude detection
+    # Agent containers
+    podman ps --filter "name='"$prefix"'" --format "CTR|{{.Names}}|{{.RunningFor}}" 2>/dev/null
+
+    # tmux windows (for correlating container → tmux target)
     if tmux list-sessions 2>/dev/null >&2; then
+      tmux list-windows -a -F "WIN|#{session_name}:#{window_index}|#{window_name}" 2>/dev/null
+
+      # Bare claude processes in tmux panes
       tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{window_name}" 2>/dev/null | while IFS="|" read -r target pane_pid cmd path wname; do
         claude_pid=""
         if [ "$cmd" = "claude" ]; then
@@ -180,7 +216,7 @@ discover_remote() {
         echo "TMUX|$target|$(basename "$path")|$elapsed"
       done
     fi
-    # Orphan PIDs (not in tmux)
+    # Orphan bare PIDs
     for pid in $(pgrep -x claude 2>/dev/null); do
       cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
       echo "PID|$pid|$(basename "$cwd")|$(ps -o etime= -p "$pid" 2>/dev/null | xargs)"
@@ -189,12 +225,38 @@ discover_remote() {
 
   [[ -z "$remote_data" ]] && return
 
-  declare -A remote_tmux_pids=()
+  # Build a map of window_name → tmux_target from WIN lines
+  declare -A win_map=()
+  while IFS='|' read -r type target wname; do
+    [[ "$type" != "WIN" ]] && continue
+    win_map["$wname"]="$target"
+  done <<< "$remote_data"
 
-  # First pass: tmux entries
+  declare -A seen_projects=()
+
+  # Pass 1: containers
+  while IFS='|' read -r type cname running_for; do
+    [[ "$type" != "CTR" ]] && continue
+    local project="${cname#"$prefix"}"
+    seen_projects["$project"]=1
+
+    local target="${win_map[$project]:-—}"
+    local session_name="${target%%:*}"
+    local status="container"
+    [[ "$target" != "—" && "$session_name" != "$AGENT_SESSION" ]] && status="container (other)"
+
+    AGENT_PROJECTS+=("$project")
+    AGENT_TARGETS+=("${alias}:${target}")
+    AGENT_ELAPSED+=("$running_for")
+    AGENT_STATUSES+=("$status")
+    AGENT_HOSTS+=("$alias")
+  done <<< "$remote_data"
+
+  # Pass 2: bare tmux entries
   while IFS='|' read -r type target project elapsed; do
     [[ "$type" != "TMUX" ]] && continue
-    remote_tmux_pids["$project"]=1
+    [[ -n "${seen_projects[$project]:-}" ]] && continue
+    seen_projects["$project"]=1
 
     local session_name="${target%%:*}"
     local status="tmux"
@@ -207,10 +269,10 @@ discover_remote() {
     AGENT_HOSTS+=("$alias")
   done <<< "$remote_data"
 
-  # Second pass: orphan PIDs
+  # Pass 3: orphan bare PIDs
   while IFS='|' read -r type pid project elapsed; do
     [[ "$type" != "PID" ]] && continue
-    [[ -n "${remote_tmux_pids[$project]:-}" ]] && continue
+    [[ -n "${seen_projects[$project]:-}" ]] && continue
 
     AGENT_PROJECTS+=("$project")
     AGENT_TARGETS+=("—")
@@ -708,6 +770,34 @@ cmd_auth() {
 
   printf "\n${Y}Auth may still be in progress.${N}\n"
   printf "Attach: ${B}ssh -t %s 'tmux attach -t %s'${N}\n" "$ssh_host" "$auth_session"
+}
+
+cmd_attach() {
+  local host_alias="${1:-}"
+
+  if [[ -z "$host_alias" ]]; then
+    # Local attach
+    if ! tmux has-session -t "$AGENT_SESSION" 2>/dev/null; then
+      err "no local '$AGENT_SESSION' session. Start one with: trimtab agent spawn <project>"
+    fi
+    exec tmux attach-session -t "$AGENT_SESSION"
+  fi
+
+  # Remote attach
+  local ssh_host=""
+  for entry in "${REMOTE_HOSTS[@]}"; do
+    parse_host "$entry"
+    if [[ "$HOST_ALIAS" == "$host_alias" ]]; then
+      ssh_host="$HOST_SSH"
+      break
+    fi
+  done
+  [[ -z "$ssh_host" ]] && err "unknown host '$host_alias'. Check $HOSTS_FILE"
+
+  remote_cmd "$ssh_host" "tmux has-session -t $AGENT_SESSION 2>/dev/null" || \
+    err "no '$AGENT_SESSION' session on $host_alias. Start one with: trimtab agent spawn --on $host_alias <project>"
+
+  exec ssh -t "$ssh_host" "tmux attach-session -t $AGENT_SESSION"
 }
 
 cmd_build() {
