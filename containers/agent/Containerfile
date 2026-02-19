@@ -1,0 +1,62 @@
+# trimtab-agent — self-contained Claude Code + Elixir dev environment
+# Build: podman build -t trimtab-agent containers/agent/
+# Run:   podman run -it --network host \
+#          -v ~/.claude:/home/dev/.claude \
+#          -v ~/1-Projects/my-project:/work \
+#          trimtab-agent
+#
+# Versions pinned for reproducibility. Update and rebuild to upgrade.
+FROM docker.io/elixir:1.19-otp-28
+
+ARG NODE_MAJOR=24
+ARG DEV_USER=dev
+ARG DEV_UID=1000
+
+# --- System packages ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    git-lfs \
+    openssh-client \
+    ripgrep \
+    jq \
+    inotify-tools \
+    build-essential \
+    sudo \
+    tmux \
+    ca-certificates \
+    gnupg \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Node.js LTS ---
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- PostgreSQL client (latest from official repo) ---
+RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Non-root user ---
+RUN useradd -m -s /bin/bash -u ${DEV_UID} ${DEV_USER} \
+    && echo "${DEV_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${DEV_USER}
+
+USER ${DEV_USER}
+WORKDIR /home/${DEV_USER}
+
+# --- Claude Code ---
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+# --- Hex + Rebar (Elixir build tools) ---
+RUN /home/${DEV_USER}/.local/bin/claude --version || true
+RUN mix local.hex --force && mix local.rebar --force
+
+WORKDIR /work
+ENTRYPOINT ["/bin/bash"]
