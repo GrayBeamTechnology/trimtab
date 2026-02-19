@@ -57,14 +57,14 @@ section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
 err() { printf "${R}error:${N} %s\n" "$1" >&2; exit 1; }
 
 # Build the podman run command for a given project
-# Usage: podman_run_cmd <home_dir> <projects_dir> <project> [selinux]
+# Usage: podman_run_cmd <home_dir> <projects_dir> <project> [selinux] [name_override]
 podman_run_cmd() {
-  local home="$1" projects="$2" project="$3" selinux="${4:-0}"
+  local home="$1" projects="$2" project="$3" selinux="${4:-0}" name="${5:-${CONTAINER_PREFIX}${3}}"
   local vol_suffix=""
   (( selinux )) && vol_suffix=":Z"
 
-  printf "podman run -it --rm --name %s%s --network host -v %s/.claude:/root/.claude%s -v %s/%s:/work%s %s -c claude" \
-    "$CONTAINER_PREFIX" "$project" \
+  printf "podman run -it --rm --name %s --network host -v %s/.claude:/root/.claude%s -v %s/%s:/work%s %s -c claude" \
+    "$name" \
     "$home" "$vol_suffix" \
     "$projects" "$project" "$vol_suffix" \
     "$AGENT_IMAGE"
@@ -570,6 +570,146 @@ cmd_broadcast() {
   done
 }
 
+cmd_auth() {
+  local host_alias="${1:-}"
+  [[ -z "$host_alias" ]] && err "usage: trimtab agent auth <host>"
+
+  local ssh_host="" remote_projects=""
+  for entry in "${REMOTE_HOSTS[@]}"; do
+    parse_host "$entry"
+    if [[ "$HOST_ALIAS" == "$host_alias" ]]; then
+      ssh_host="$HOST_SSH"
+      remote_projects="$HOST_PROJECTS"
+      break
+    fi
+  done
+  [[ -z "$ssh_host" ]] && err "unknown host '$host_alias'. Check $HOSTS_FILE"
+
+  local remote_home
+  remote_home=$(dirname "$remote_projects")
+
+  printf "${C}Launching Claude on %s for auth...${N}\n" "$host_alias"
+
+  # Create a temp tmux session for auth (unique names to avoid conflicts)
+  local auth_session="auth-$$"
+  local auth_container="auth-${host_alias}-$$"
+  local selinux
+  selinux=$(detect_selinux_remote "$ssh_host")
+  local run_cmd
+  run_cmd=$(podman_run_cmd "$remote_home" "$remote_projects" "trimtab" "$selinux" "$auth_container")
+
+  remote_cmd "$ssh_host" "
+    tmux new-session -d -s $auth_session
+    tmux send-keys -t $auth_session '$run_cmd' Enter
+  " || err "failed to start auth session on $host_alias"
+
+  # Cleanup helper — kill temp tmux session and container
+  auth_cleanup() {
+    remote_cmd "$ssh_host" "tmux kill-session -t $auth_session 2>/dev/null; podman rm -f $auth_container 2>/dev/null" 2>/dev/null || true
+  }
+
+  # Send Enter to remote tmux pane
+  auth_send_enter() {
+    remote_cmd "$ssh_host" "tmux send-keys -t $auth_session Enter" 2>/dev/null
+  }
+
+  # Send text to remote tmux pane (with delay before Enter for Claude TUI)
+  auth_send_text() {
+    remote_cmd "$ssh_host" "tmux send-keys -t $auth_session '$1'; sleep 0.3; tmux send-keys -t $auth_session Enter" 2>/dev/null
+  }
+
+  # Capture remote pane text
+  auth_pane() {
+    remote_cmd "$ssh_host" "tmux capture-pane -t $auth_session -p -S -${1:-30}" 2>/dev/null
+  }
+
+  # Extract OAuth URL from pane (handles multi-line wrapped URLs)
+  extract_url() {
+    echo "$1" | awk '/^https:\/\/claude\.ai\/oauth/{p=1} p{if(/^[[:space:]]*$/)exit; printf "%s",$0}' | tr -d ' '
+  }
+
+  # Navigate wizard + auth flow via state machine
+  # States: wizard steps → OAuth URL → code paste → post-auth wizards → prompt
+  printf "${D}Waiting for Claude to start...${N}\n"
+  local state="waiting"
+  for i in $(seq 1 120); do
+    local pane_text
+    pane_text=$(auth_pane 30)
+
+    # Terminal state: main prompt reached
+    if echo "$pane_text" | grep -q "Tips for getting started\|What can I help\|Type a message\|for shortcuts"; then
+      printf "${G}Authenticated on %s!${N}\n" "$host_alias"
+      auth_cleanup
+      return
+    fi
+
+    case "$state" in
+      waiting)
+        # Dismiss stale credential errors
+        if echo "$pane_text" | grep -q "Press Enter to retry"; then
+          printf "${D}  dismissing auth error...${N}\n"
+          auth_send_enter
+          sleep 3; continue
+        fi
+
+        # Wizard steps (theme selection, login method)
+        if echo "$pane_text" | grep -q "Choose the text style\|Select login method"; then
+          printf "${D}  accepting wizard default...${N}\n"
+          auth_send_enter
+          sleep 3; continue
+        fi
+
+        # OAuth URL appeared — extract and prompt user
+        if echo "$pane_text" | grep -q "Browser didn't open"; then
+          local url
+          url=$(extract_url "$pane_text")
+          if [[ -n "$url" ]]; then
+            printf "\n${B}Opening auth URL in browser...${N}\n"
+            xdg-open "$url" 2>/dev/null || open "$url" 2>/dev/null || true
+
+            printf "\nAfter authenticating, paste the ${B}full code${N} (including the #state part):\n"
+            read -rp "> " auth_code
+            [[ -z "$auth_code" ]] && { auth_cleanup; err "no code provided"; }
+
+            auth_send_text "$auth_code"
+            state="post_auth"
+            sleep 5; continue
+          fi
+        fi
+        ;;
+
+      post_auth)
+        # After successful auth, auto-dismiss remaining wizard steps
+        # "Login successful" / "Press Enter to continue" / security note / trust folder / effort
+        if echo "$pane_text" | grep -q "Press Enter to continue\|Yes, I trust\|Use high effort\|Select login method\|Choose the text style"; then
+          printf "${D}  accepting post-auth default...${N}\n"
+          auth_send_enter
+          sleep 3; continue
+        fi
+
+        # Check for auth failure
+        if echo "$pane_text" | grep -q "Invalid code\|OAuth error"; then
+          printf "${R}Auth failed.${N} Try again? (y/n): "
+          read -rp "" retry
+          if [[ "$retry" =~ ^[Yy]$ ]]; then
+            auth_send_enter  # dismiss error
+            state="waiting"
+            sleep 3; continue
+          else
+            auth_cleanup
+            return
+          fi
+        fi
+        ;;
+    esac
+
+    sleep 2
+  done
+
+  printf "\n${Y}Auth may still be in progress.${N}\n"
+  printf "Attach: ${B}ssh -t %s 'tmux attach -t %s'${N}\n" "$ssh_host" "$auth_session"
+}
+
 cmd_build() {
   local host_flag=""
 
@@ -626,6 +766,7 @@ case "$subcmd" in
   list|ls)       cmd_list "$@" ;;
   spawn)         cmd_spawn "$@" ;;
   build)         cmd_build "$@" ;;
+  auth)          cmd_auth "$@" ;;
   attach|a)      cmd_attach "$@" ;;
   peek)          cmd_peek "$@" ;;
   send)          cmd_send "$@" ;;
@@ -640,6 +781,7 @@ Commands:
   list                                    Discover all Claude sessions (local + remote)
   spawn [--on <host>] <project>           Launch Claude in a container via tmux
   build [--on <host>]                     Build the trimtab-agent container image
+  auth <host>                             Authenticate Claude Code on a remote host
   attach [host]                           Attach to the agents tmux session (local or remote)
   peek <project|host:project> [-n N] [-f] Capture recent pane output (default: 50 lines)
   send <project|host:project> <text>      Send keystrokes to an agent session
@@ -656,6 +798,7 @@ Examples:
   trimtab agent build --on thor                  # build on remote host
   trimtab agent spawn gridplay-v1                # start locally (in container)
   trimtab agent spawn --on thor gridplay-v1      # start on remote host (in container)
+  trimtab agent auth thor                        # authenticate Claude on thor (opens browser)
   trimtab agent attach thor                      # attach to thor's agents session
   trimtab agent peek thor:gridplay-v1            # peek at remote session
   trimtab agent send thor:gridplay-v1 "/status"  # send to remote session

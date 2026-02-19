@@ -207,6 +207,13 @@ if [[ -f "$HOME/.claude/settings.json" ]]; then
   ok "Claude settings.json copied"
 fi
 
+# rsync credentials (OAuth token — portable, not machine-bound)
+if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+  rsync -c "$HOME/.claude/.credentials.json" "${SSH_HOST}:~/.claude/.credentials.json"
+  remote "chmod 600 ~/.claude/.credentials.json"
+  ok "Claude credentials copied (pre-authed)"
+fi
+
 # rsync hooks directory
 if [[ -d "$HOME/.claude/hooks" ]]; then
   rsync -a --delete "$HOME/.claude/hooks/" "${SSH_HOST}:~/.claude/hooks/"
