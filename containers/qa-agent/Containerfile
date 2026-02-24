@@ -1,0 +1,101 @@
+# trimtab-qa-agent — agent-agnostic QA runner with browser automation
+#
+# Build:  podman build -t trimtab-qa-agent containers/qa-agent/
+# Run:    podman run -it --rm --network host --userns=keep-id \
+#           -e QA_AGENT=claude \
+#           -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+#           -v ~/.claude:/home/agent/.claude:Z \
+#           -v ~/1-Projects/myapp/docs/personas:/personas:ro,Z \
+#           -v ~/1-Projects/myapp/docs/qa-reports:/reports:Z \
+#           trimtab-qa-agent rachel-kim.md
+#
+# Supports multiple AI agents (QA_AGENT env var):
+#   claude  — Claude Code CLI (default)
+#   goose   — Goose CLI by Block
+#
+# --userns=keep-id maps host UID to agent (1000) inside.
+# Volume :Z suffix needed on Fedora (SELinux). Omit on NixOS.
+#
+# Versions pinned for reproducibility. Update and rebuild to upgrade.
+FROM docker.io/library/node:22-bookworm
+
+# --- System packages ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    ripgrep \
+    jq \
+    sudo \
+    ca-certificates \
+    gnupg \
+    unzip \
+    procps \
+    # Chromium rendering dependencies (headless still needs these)
+    fonts-liberation \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    xdg-utils \
+    # Python for browser-use (encapsulated — not part of our stack)
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Google Chrome Stable ---
+# Stable builds are better tested for headless automation than Debian's chromium.
+# --no-sandbox is required in unprivileged containers.
+RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+    | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+    > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Agent: Claude Code ---
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && cp /root/.local/bin/claude /usr/local/bin/claude
+
+# --- Agent: Goose CLI (Block/Square) ---
+RUN curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh \
+    | CONFIGURE=false bash \
+    && cp /root/.local/bin/goose /usr/local/bin/goose 2>/dev/null || true
+
+# --- Non-root user (UID 1000 for --userns=keep-id) ---
+# node:22-bookworm already has user "node" at UID 1000.
+# Rename to "agent" for consistency with trimtab-agent pattern.
+RUN usermod -l agent -d /home/agent -m node \
+    && groupmod -n agent node
+
+USER agent
+
+# --- browser-use in isolated venv ---
+# browser-use is Python but encapsulated here — no Python in our stack.
+RUN python3 -m venv /home/agent/.venv \
+    && /home/agent/.venv/bin/pip install --no-cache-dir browser-use
+
+# --- Environment ---
+ENV TERM=xterm-256color \
+    CLAUDE_CODE_DISABLE_AUTO_UPDATE=1 \
+    CHROME_PATH=/usr/bin/google-chrome-stable \
+    CHROMIUM_FLAGS="--no-sandbox --disable-gpu --disable-dev-shm-usage" \
+    PATH="/home/agent/.venv/bin:$PATH"
+
+# --- Entrypoint ---
+COPY --chown=agent:agent qa-runner.sh /home/agent/qa-runner.sh
+RUN chmod +x /home/agent/qa-runner.sh
+
+WORKDIR /work
+ENTRYPOINT ["/home/agent/qa-runner.sh"]
