@@ -8,12 +8,7 @@
 set -uo pipefail
 
 source "$(dirname "$0")/trimtab-portable.sh"
-
-R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
-B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
-A=$'\033[0;33m'   N=$'\033[0m'
-
-PROJECTS_DIR="$HOME/1-Projects"
+source "$(dirname "$0")/trimtab-common.sh"
 SINCE="24h"
 AI_MODE=false
 CHEZMOI_PREFIX=$(_chezmoi_projects_prefix)
@@ -57,8 +52,6 @@ normalize_since() {
 }
 
 GIT_SINCE=$(normalize_since "$SINCE")
-
-section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
 
 # Collect raw observations for potential AI summary
 RAW_OBSERVATIONS=""
@@ -258,16 +251,7 @@ if [[ "$AI_MODE" == true ]]; then
   section "AI Briefing"
 
   # Find API key
-  API_KEY=""
-  for envfile in "$HOME/1-Projects/decision_forge_v2/.env" "$HOME/1-Projects/ai-brand-studio/.env" "$HOME/.env"; do
-    if [[ -f "$envfile" ]]; then
-      key=$(grep '^OPENROUTER_API_KEY=' "$envfile" 2>/dev/null | cut -d= -f2-)
-      if [[ -n "$key" ]]; then
-        API_KEY="$key"
-        break
-      fi
-    fi
-  done
+  API_KEY=$(_find_openrouter_key)
 
   if [[ -z "$API_KEY" ]]; then
     printf "  ${R}No OPENROUTER_API_KEY found${N}\n"
@@ -277,6 +261,7 @@ if [[ "$AI_MODE" == true ]]; then
 
     # Write data to temp files to avoid heredoc/f-string escaping issues
     tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
     printf '%s' "$API_KEY" > "$tmpdir/api_key"
     printf '%s' "$RAW_OBSERVATIONS" > "$tmpdir/observations"
     printf '%s' "$RECENT_LESSONS" > "$tmpdir/lessons"
@@ -339,7 +324,6 @@ except Exception as e:
     sys.exit(1)
 ' "$tmpdir"
     )
-    rm -rf "$tmpdir"
 
     if [[ -n "$BRIEFING" ]]; then
       printf "  \033[2K"  # clear the "Generating..." line

@@ -5,24 +5,10 @@
 # Idempotent: safe to re-run. Checks before acting at every step.
 set -euo pipefail
 
-# --- Colors ---
-R=$'\033[0;31m'
-G=$'\033[0;32m'
-D=$'\033[2m'
-B=$'\033[1m'
-C=$'\033[0;36m'
-Y=$'\033[0;33m'
-N=$'\033[0m'
+source "$(dirname "$0")/trimtab-common.sh"
 
-PROJECTS_DIR="$HOME/1-Projects"
 HOSTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/trimtab/hosts"
 STIGNORE_SRC="$PROJECTS_DIR/trimtab/.stignore"
-
-err() { printf "${R}error:${N} %s\n" "$1" >&2; exit 1; }
-ok()  { printf "  ${G}✓${N} %s\n" "$1"; }
-skip(){ printf "  ${D}· %s (already done)${N}\n" "$1"; }
-info(){ printf "  ${C}…${N} %s\n" "$1"; }
-warn(){ printf "  ${Y}!${N} %s\n" "$1"; }
 
 remote() { ssh -o ConnectTimeout=5 -o BatchMode=yes "$SSH_HOST" "$@"; }
 

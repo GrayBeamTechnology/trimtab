@@ -3,11 +3,8 @@
 # Detects project type and sets up quality stack accordingly
 set -euo pipefail
 
-R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
-B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
-N=$'\033[0m'
-
 source "$(dirname "$0")/trimtab-portable.sh"
+source "$(dirname "$0")/trimtab-common.sh"
 
 # Handle help before arg parsing
 case "${1:-}" in

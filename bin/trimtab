@@ -40,6 +40,8 @@ Commands:
   agent     Manage Claude Code sessions via tmux (local + remote)
   observe   Cross-project briefing (what happened since you last looked)
   steer     Audit trim tab infrastructure across projects
+  secrets   Scan for committed secrets and audit .env hygiene
+  qa        Containerized persona-driven QA runner
   init      Bootstrap trim tab config for a project
   init-host Bootstrap a remote machine as an agent host
 

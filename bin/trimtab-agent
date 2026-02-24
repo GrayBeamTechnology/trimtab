@@ -4,17 +4,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/trimtab-portable.sh"
-
-# --- Colors ---
-R=$'\033[0;31m'
-G=$'\033[0;32m'
-D=$'\033[2m'
-B=$'\033[1m'
-C=$'\033[0;36m'
-Y=$'\033[0;33m'
-N=$'\033[0m'
-
-PROJECTS_DIR="$HOME/1-Projects"
+source "$(dirname "$0")/trimtab-common.sh"
 AGENT_SESSION="agents"
 AGENT_IMAGE="trimtab-agent"
 CONTAINER_PREFIX="agent-"
@@ -49,14 +39,6 @@ remote_cmd() {
   ssh -o ConnectTimeout=3 -o BatchMode=yes "$ssh_host" "$@" 2>/dev/null
 }
 
-# Run tmux command on a remote host
-remote_tmux() {
-  local ssh_host="$1"; shift
-  remote_cmd "$ssh_host" "tmux $*"
-}
-
-section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
-err() { printf "${R}error:${N} %s\n" "$1" >&2; exit 1; }
 
 # Build the podman run command for a given project
 # Usage: podman_run_cmd <home_dir> <projects_dir> <project> [selinux] [name_override]
@@ -72,9 +54,9 @@ podman_run_cmd() {
     "$AGENT_IMAGE"
 }
 
-# Detect if host uses SELinux (Fedora yes, NixOS no)
+# Detect if host has SELinux enforcing (checks actual state, not distro)
 detect_selinux() {
-  if [[ -f /etc/fedora-release ]]; then
+  if command -v getenforce &>/dev/null && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
     echo 1
   else
     echo 0
@@ -83,7 +65,7 @@ detect_selinux() {
 
 detect_selinux_remote() {
   local ssh_host="$1"
-  remote_cmd "$ssh_host" 'test -f /etc/fedora-release && echo 1 || echo 0' || echo 0
+  remote_cmd "$ssh_host" 'command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ] && echo 1 || echo 0' || echo 0
 }
 
 # ============================================================
@@ -575,7 +557,8 @@ cmd_send() {
     tmux send-keys -t "$RESOLVED_TARGET" "$text" Enter
   else
     printf "${D}sending to %s on %s (%s):${N} %s\n" "$target_input" "$RESOLVED_HOST" "$RESOLVED_TARGET" "$text"
-    remote_cmd "$RESOLVED_SSH" "tmux send-keys -t '$RESOLVED_TARGET' '$text' Enter"
+    local escaped_text="${text//\'/\'\\\'\'}"
+    remote_cmd "$RESOLVED_SSH" "tmux send-keys -t '$RESOLVED_TARGET' '$escaped_text' Enter"
   fi
 }
 
@@ -628,7 +611,8 @@ cmd_broadcast() {
         parse_host "$entry"
         [[ "$HOST_ALIAS" == "$alias" ]] && ssh_host="$HOST_SSH" && break
       done
-      remote_cmd "$ssh_host" "tmux send-keys -t '$tmux_target' '$text' Enter"
+      local escaped_text="${text//\'/\'\\\'\'}"
+      remote_cmd "$ssh_host" "tmux send-keys -t '$tmux_target' '$escaped_text' Enter"
     fi
     printf "  ${G}sent${N} → %s %s\n" "${projects[$i]}" "${D}[${h}]${N}"
   done
@@ -844,8 +828,6 @@ cmd_build() {
     ok "image $AGENT_IMAGE built on $host_flag"
   fi
 }
-
-ok() { printf "  ${G}✓${N} %s\n" "$1"; }
 
 # ============================================================
 # DISPATCH

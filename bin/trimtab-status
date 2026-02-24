@@ -4,17 +4,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/trimtab-portable.sh"
-
-# --- Colors (raw ANSI, no tput) ---
-R=$'\033[0;31m'   # red
-G=$'\033[0;32m'   # green
-D=$'\033[2m'      # dim
-B=$'\033[1m'      # bold
-C=$'\033[0;36m'   # cyan
-Y=$'\033[0;33m'   # yellow
-N=$'\033[0m'      # reset
-
-section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
+source "$(dirname "$0")/trimtab-common.sh"
 
 # --- Port-to-project mapping ---
 declare -A PORT_PROJECT=(

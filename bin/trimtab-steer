@@ -3,14 +3,12 @@
 # Shows CLAUDE.md, memory files, skills, quality tools, and config drift
 set -euo pipefail
 
-R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
-B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
-A=$'\033[0;33m'   N=$'\033[0m'
+source "$(dirname "$0")/trimtab-portable.sh"
+source "$(dirname "$0")/trimtab-common.sh"
 
-PROJECTS_DIR="$HOME/1-Projects"
+CHEZMOI_PREFIX=$(_chezmoi_projects_prefix)
 CMD="${1:-audit}"
-
-section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
+shift 2>/dev/null || true
 
 # ============================================================
 # AUDIT — show trim tab infrastructure across all projects
@@ -39,7 +37,7 @@ cmd_audit() {
     fi
 
     # Memory files
-    memory_dir="$HOME/.claude/projects/-home-mchughson-1-Projects-${proj}/memory"
+    memory_dir="$HOME/.claude/projects/-${CHEZMOI_PREFIX}-${proj}/memory"
     if [[ -d "$memory_dir" ]]; then
       mcount=$(find "$memory_dir" -name "*.md" 2>/dev/null | wc -l)
       if (( mcount > 0 )); then
@@ -76,7 +74,7 @@ cmd_audit() {
     printf "  ${G}●${N} ~/.claude/CLAUDE.md          ${D}(%d lines)${N}\n" "$lines"
   fi
 
-  global_memory="$HOME/.claude/projects/-home-mchughson-1-Projects/memory"
+  global_memory="$HOME/.claude/projects/-${CHEZMOI_PREFIX}/memory"
   if [[ -d "$global_memory" ]]; then
     mcount=$(find "$global_memory" -name "*.md" 2>/dev/null | wc -l)
     printf "  ${G}●${N} Global memory files           ${D}(%d files)${N}\n" "$mcount"
@@ -299,7 +297,6 @@ cmd_gaps() {
 # ============================================================
 cmd_sync() {
   local use_ai=false
-  shift 2>/dev/null || true
   for arg in "$@"; do
     [[ "$arg" == "--ai" ]] && use_ai=true
   done
@@ -342,11 +339,11 @@ ${extracted}
   section "Memory File Lessons"
   local memory_lessons=""
 
-  for memory_dir in "$HOME/.claude/projects/-home-mchughson-1-Projects-"*/memory/; do
+  for memory_dir in "$HOME/.claude/projects/-${CHEZMOI_PREFIX}-"*/memory/; do
     [[ -d "$memory_dir" ]] || continue
     local proj
     proj=$(basename "$(dirname "$memory_dir")")
-    proj="${proj#-home-mchughson-1-Projects-}"
+    proj="${proj#-${CHEZMOI_PREFIX}-}"
 
     for md_file in "$memory_dir"*.md; do
       [[ -f "$md_file" ]] || continue
@@ -419,13 +416,8 @@ ${extracted}
   printf "  ${D}Analyzing %d lessons across %d projects...${N}\n" "$lesson_count" "$project_count"
 
   # Find API key
-  local api_key=""
-  for env_file in "$PROJECTS_DIR/decision_forge_v2/.env" "$PROJECTS_DIR/ai-brand-studio/.env" "$HOME/.env"; do
-    if [[ -f "$env_file" ]]; then
-      api_key=$(grep "^OPENROUTER_API_KEY=" "$env_file" 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'")
-      [[ -n "$api_key" ]] && break
-    fi
-  done
+  local api_key
+  api_key=$(_find_openrouter_key)
 
   if [[ -z "$api_key" ]]; then
     printf "  ${R}No OPENROUTER_API_KEY found${N}\n"
@@ -506,12 +498,263 @@ except Exception as e:
 }
 
 # ============================================================
+# UX — audit LiveView UX anti-patterns across projects
+# ============================================================
+cmd_ux() {
+  local filter_project="${1:-}"
+
+  section "UX Pattern Audit (LiveView Projects)"
+
+  local total_issues=0
+  local projects_scanned=0
+
+  for proj_dir in "$PROJECTS_DIR"/*/; do
+    [[ -d "$proj_dir" ]] || continue
+    local proj
+    proj=$(basename "$proj_dir")
+
+    # If filtering to a single project, skip others
+    if [[ -n "$filter_project" ]] && [[ "$proj" != "$filter_project" ]]; then
+      continue
+    fi
+
+    # Only LiveView projects
+    [[ -f "$proj_dir/mix.exs" ]] || continue
+    grep -q "phoenix_live_view\|phoenix_html" "$proj_dir/mix.exs" 2>/dev/null || continue
+
+    projects_scanned=$((projects_scanned + 1))
+    local proj_issues=()
+
+    # Find .heex files, excluding deps/_build/_archive/error_html
+    local heex_files=()
+    while IFS= read -r -d '' f; do
+      heex_files+=("$f")
+    done < <(find "$proj_dir/lib" -name "*.heex" \
+      -not -path "*/deps/*" \
+      -not -path "*/_build/*" \
+      -not -path "*/_archive/*" \
+      -not -path "*/error_html/*" \
+      -print0 2>/dev/null)
+
+    # Check 1: Raw <a href= (should be <.link navigate=)
+    local raw_links=()
+    for file in "${heex_files[@]}"; do
+      local matches
+      matches=$(grep -n '<a[[:space:]]\+href=' "$file" 2>/dev/null \
+        | grep -v 'href="https\?://' \
+        | grep -v 'href="#' || true)
+      if [[ -n "$matches" ]]; then
+        while IFS= read -r line; do
+          local relpath="${file#"$proj_dir"}"
+          local lineno="${line%%:*}"
+          raw_links+=("${relpath}:${lineno}")
+        done <<< "$matches"
+      fi
+    done
+
+    if (( ${#raw_links[@]} > 0 )); then
+      proj_issues+=("RAW_LINKS")
+    fi
+
+    # Check 2: <button type="submit"> without phx-disable-with
+    local no_disable=()
+    for file in "${heex_files[@]}"; do
+      local matches
+      matches=$(grep -n 'type="submit"' "$file" 2>/dev/null \
+        | grep -v 'phx-disable-with' || true)
+      if [[ -n "$matches" ]]; then
+        while IFS= read -r line; do
+          local relpath="${file#"$proj_dir"}"
+          local lineno="${line%%:*}"
+          no_disable+=("${relpath}:${lineno}")
+        done <<< "$matches"
+      fi
+    done
+
+    if (( ${#no_disable[@]} > 0 )); then
+      proj_issues+=("NO_DISABLE_WITH")
+    fi
+
+    # Check 3: Uses phx-click but missing CSS loading variants
+    local has_phx_click=false
+    local has_loading_css=false
+    for file in "${heex_files[@]}"; do
+      if grep -q 'phx-click=' "$file" 2>/dev/null; then
+        has_phx_click=true
+        break
+      fi
+    done
+
+    if $has_phx_click; then
+      local css_file="$proj_dir/assets/css/app.css"
+      if [[ -f "$css_file" ]]; then
+        if grep -q 'phx-click-loading\|@custom-variant' "$css_file" 2>/dev/null; then
+          has_loading_css=true
+        fi
+      fi
+    fi
+
+    local missing_loading=false
+    if $has_phx_click && ! $has_loading_css; then
+      missing_loading=true
+      proj_issues+=("MISSING_LOADING_CSS")
+    fi
+
+    # Check 4: phx-change on bare <input>/<select>/<textarea> outside a <form>
+    local bare_phx_change=()
+    for file in "${heex_files[@]}"; do
+      local matches
+      matches=$(grep -n 'phx-change=' "$file" 2>/dev/null || true)
+      [[ -z "$matches" ]] && continue
+      while IFS= read -r line; do
+        # Skip if the line contains <form (it's on the form itself)
+        echo "$line" | grep -q '<form' && continue
+        # Flag input/select/textarea with phx-change
+        if echo "$line" | grep -qE '<(input|select|textarea)[[:space:]]' 2>/dev/null; then
+          local relpath="${file#"$proj_dir"}"
+          local lineno="${line%%:*}"
+          bare_phx_change+=("${relpath}:${lineno}")
+        fi
+      done <<< "$matches"
+    done
+
+    if (( ${#bare_phx_change[@]} > 0 )); then
+      proj_issues+=("BARE_PHX_CHANGE")
+    fi
+
+    # Check 5: :utc_datetime without _usec in migrations
+    local bad_datetime=()
+    while IFS= read -r -d '' migfile; do
+      local matches
+      matches=$(grep -n ':utc_datetime' "$migfile" 2>/dev/null | grep -v '_usec' || true)
+      if [[ -n "$matches" ]]; then
+        while IFS= read -r line; do
+          local relpath="${migfile#"$proj_dir"}"
+          local lineno="${line%%:*}"
+          bad_datetime+=("${relpath}:${lineno}")
+        done <<< "$matches"
+      fi
+    done < <(find "$proj_dir" -path "*/migrations/*.exs" -not -path "*/deps/*" -not -path "*/_build/*" -print0 2>/dev/null)
+
+    if (( ${#bad_datetime[@]} > 0 )); then
+      proj_issues+=("UTC_DATETIME")
+    fi
+
+    # Check 6: <textarea value= (browsers ignore it)
+    local textarea_value=()
+    for file in "${heex_files[@]}"; do
+      local matches
+      matches=$(grep -n '<textarea[[:space:]].*value=' "$file" 2>/dev/null || true)
+      if [[ -n "$matches" ]]; then
+        while IFS= read -r line; do
+          local relpath="${file#"$proj_dir"}"
+          local lineno="${line%%:*}"
+          textarea_value+=("${relpath}:${lineno}")
+        done <<< "$matches"
+      fi
+    done
+
+    if (( ${#textarea_value[@]} > 0 )); then
+      proj_issues+=("TEXTAREA_VALUE")
+    fi
+
+    # Check 7: Missing catch-all handle_event
+    local missing_catchall=()
+    local ex_files=()
+    while IFS= read -r -d '' f; do
+      ex_files+=("$f")
+    done < <(find "$proj_dir/lib" -name "*.ex" -not -path "*/deps/*" -not -path "*/_build/*" -print0 2>/dev/null)
+
+    for file in "${ex_files[@]}"; do
+      # Only check files that define handle_event
+      grep -q 'def handle_event(' "$file" 2>/dev/null || continue
+      # Check if a catch-all exists (matches any event name with _ or variable)
+      if ! grep -qE 'def handle_event\(\s*(_|[a-z_]+)\s*,\s*(_|_[a-z_]*)\s*,\s*socket\)' "$file" 2>/dev/null; then
+        local relpath="${file#"$proj_dir"}"
+        missing_catchall+=("$relpath")
+      fi
+    done
+
+    if (( ${#missing_catchall[@]} > 0 )); then
+      proj_issues+=("MISSING_CATCHALL")
+    fi
+
+    # Print project results if it has issues
+    if (( ${#proj_issues[@]} > 0 )); then
+      printf "\n  ${B}%s${N}\n" "$proj"
+
+      if (( ${#raw_links[@]} > 0 )); then
+        printf "    ${Y}●${N} Raw <a href=...> — use <.link navigate=...>\n"
+        for loc in "${raw_links[@]}"; do
+          printf "      ${D}%s${N}\n" "$loc"
+        done
+        total_issues=$((total_issues + ${#raw_links[@]}))
+      fi
+
+      if (( ${#no_disable[@]} > 0 )); then
+        printf "    ${Y}●${N} <button type=\"submit\"> without phx-disable-with\n"
+        for loc in "${no_disable[@]}"; do
+          printf "      ${D}%s${N}\n" "$loc"
+        done
+        total_issues=$((total_issues + ${#no_disable[@]}))
+      fi
+
+      if $missing_loading; then
+        printf "    ${Y}●${N} Uses phx-click but missing CSS @custom-variant for loading states\n"
+        total_issues=$((total_issues + 1))
+      fi
+
+      if (( ${#bare_phx_change[@]} > 0 )); then
+        printf "    ${Y}●${N} phx-change on bare <input> outside <form>\n"
+        for loc in "${bare_phx_change[@]}"; do
+          printf "      ${D}%s${N}\n" "$loc"
+        done
+        total_issues=$((total_issues + ${#bare_phx_change[@]}))
+      fi
+
+      if (( ${#bad_datetime[@]} > 0 )); then
+        printf "    ${Y}●${N} :utc_datetime without _usec in migration\n"
+        for loc in "${bad_datetime[@]}"; do
+          printf "      ${D}%s${N}\n" "$loc"
+        done
+        total_issues=$((total_issues + ${#bad_datetime[@]}))
+      fi
+
+      if (( ${#textarea_value[@]} > 0 )); then
+        printf "    ${Y}●${N} <textarea value=...> — browsers ignore value attr on textarea\n"
+        for loc in "${textarea_value[@]}"; do
+          printf "      ${D}%s${N}\n" "$loc"
+        done
+        total_issues=$((total_issues + ${#textarea_value[@]}))
+      fi
+
+      if (( ${#missing_catchall[@]} > 0 )); then
+        printf "    ${Y}●${N} handle_event without catch-all clause (crash loop risk)\n"
+        for loc in "${missing_catchall[@]}"; do
+          printf "      ${D}%s${N}\n" "$loc"
+        done
+        total_issues=$((total_issues + ${#missing_catchall[@]}))
+      fi
+    fi
+  done
+
+  # Summary
+  section "Summary"
+  printf "  ${D}Projects scanned: %d | Issues: %d${N}\n" "$projects_scanned" "$total_issues"
+
+  if (( total_issues == 0 )); then
+    printf "  ${G}No UX anti-patterns found.${N}\n"
+  fi
+}
+
+# ============================================================
 # DISPATCH
 # ============================================================
 case "$CMD" in
   audit)  cmd_audit ;;
   gaps)   cmd_gaps ;;
   sync)   cmd_sync "$@" ;;
+  ux)     cmd_ux "$@" ;;
   *)
     echo "trimtab steer — manage trim tab infrastructure"
     echo ""
@@ -521,5 +764,6 @@ case "$CMD" in
     echo "  audit    Show trim tab infrastructure across all projects (default)"
     echo "  gaps     Show projects missing key infrastructure"
     echo "  sync     Extract and propagate lessons across projects (--ai for analysis)"
+    echo "  ux       Audit LiveView UX anti-patterns (raw links, missing disable-with, etc.)"
     ;;
 esac
