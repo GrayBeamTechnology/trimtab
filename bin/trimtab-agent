@@ -3,6 +3,8 @@
 # Usage: trimtab agent [list|spawn|peek|send|broadcast] [args...]
 set -euo pipefail
 
+source "$(dirname "$0")/trimtab-portable.sh"
+
 # --- Colors ---
 R=$'\033[0;31m'
 G=$'\033[0;32m'
@@ -175,7 +177,7 @@ discover_local() {
     [[ -z "$pid" ]] && continue
 
     local cwd project elapsed
-    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+    cwd=$(_proc_cwd "$pid") || continue
     project=$(basename "$cwd")
     [[ -n "${seen_projects[$project]:-}" ]] && continue
 

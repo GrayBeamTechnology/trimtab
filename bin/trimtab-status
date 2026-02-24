@@ -3,6 +3,8 @@
 # Designed for phone-width SSH sessions (~60 chars)
 set -euo pipefail
 
+source "$(dirname "$0")/trimtab-portable.sh"
+
 # --- Colors (raw ANSI, no tput) ---
 R=$'\033[0;31m'   # red
 G=$'\033[0;32m'   # green
@@ -20,6 +22,7 @@ declare -A PORT_PROJECT=(
   [4001]="tallmadge"
   [4002]="family_meetup"
   [4003]="akro_backend"
+  [4004]="ai-brand-studio"
   [4010]="credentialvault"
   [4013]="todd_agent"
   [5173]="credentialvault-fe"
@@ -29,7 +32,7 @@ declare -A PORT_PROJECT=(
 resolve_4000() {
   local pid="$1"
   local cwd
-  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || { echo "unknown"; return; }
+  cwd=$(_proc_cwd "$pid") || { echo "unknown"; return; }
   basename "$cwd"
 }
 
@@ -38,13 +41,8 @@ resolve_4000() {
 # ============================================================
 section "Dev Servers"
 found_server=0
-while IFS= read -r line; do
-  # Extract port and pid from ss output
-  port=$(echo "$line" | grep -oP ':(\d+)\s' | head -1 | tr -d ': ')
-  pid=$(echo "$line" | grep -oP 'pid=(\d+)' | head -1 | sed 's/pid=//')
+while IFS=$'\t' read -r port pid; do
   [[ -z "$port" || -z "$pid" ]] && continue
-  # Only care about ports in our range
-  (( port < 4000 || port > 5200 )) && continue
 
   project="${PORT_PROJECT[$port]:-}"
   if [[ "$port" == "4000" && -n "$pid" ]]; then
@@ -55,7 +53,7 @@ while IFS= read -r line; do
 
   printf "  ${G}●${N} :%s  %s\n" "$port" "$project"
   found_server=1
-done < <(ss -tlnp 2>/dev/null | grep -P ':(4\d{3}|51[0-9]{2})\b' || true)
+done < <(_listening_ports)
 
 (( found_server == 0 )) && printf "  ${D}none${N}\n"
 
@@ -66,7 +64,7 @@ section "Claude Sessions"
 found_claude=0
 while IFS= read -r pid; do
   [[ -z "$pid" ]] && continue
-  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+  cwd=$(_proc_cwd "$pid") || continue
   proj=$(basename "$cwd")
   elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
   printf "  ${G}●${N} %-20s %s\n" "$proj" "${D}${elapsed}${N}"
@@ -115,8 +113,8 @@ fi
 # SYSTEM
 # ============================================================
 section "System"
-load=$(cut -d' ' -f1-3 /proc/loadavg)
-mem_line=$(free -m | awk '/^Mem:/ {printf "%dM / %dM (%.0f%%)", $3, $2, $3/$2*100}')
+load=$(_system_load)
+mem_line=$(_system_mem)
 disk=$(df -h / | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')
 
 printf "  load   %s\n" "$load"
@@ -127,7 +125,7 @@ printf "  disk   %s\n" "$disk"
 # GPU (nixos-thor)
 # ============================================================
 section "GPU (nixos-thor)"
-if timeout 2 ssh -o ConnectTimeout=1 -o BatchMode=yes nixos-thor "echo ok" >/dev/null 2>&1; then
+if _timeout 2 ssh -o ConnectTimeout=1 -o BatchMode=yes nixos-thor "echo ok" >/dev/null 2>&1; then
   gpu_info=$(ssh -o ConnectTimeout=1 -o BatchMode=yes nixos-thor \
     "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1" 2>/dev/null || echo "")
   if [[ -n "$gpu_info" ]]; then

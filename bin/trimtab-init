@@ -7,8 +7,29 @@ R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
 B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
 N=$'\033[0m'
 
+source "$(dirname "$0")/trimtab-portable.sh"
+
+# Handle help before arg parsing
+case "${1:-}" in
+  -h|--help)
+    cat <<EOF
+trimtab init — bootstrap trim tab infrastructure for a project
+
+Usage: trimtab init [directory]
+
+Detects project type (Elixir, Node, Rust, Python) and sets up:
+  - CLAUDE.md template
+  - .claude/settings.json
+  - Project memory directory
+  - .gitignore entries
+  - Language-specific quality infrastructure (Credo, ESLint, Clippy, etc.)
+EOF
+    exit 0
+    ;;
+esac
+
 TARGET="${1:-.}"
-TARGET=$(readlink -f "$TARGET")
+TARGET=$(_realpath "$TARGET")
 PROJ=$(basename "$TARGET")
 
 if [[ ! -d "$TARGET" ]]; then
@@ -84,7 +105,7 @@ add_file "$TARGET/.claude/settings.json" '{
 ' ".claude/settings.json"
 
 # ── Memory directory (project-scoped in ~/.claude/) ──
-memory_dir="$HOME/.claude/projects/-home-mchughson-1-Projects-${PROJ}/memory"
+memory_dir="$HOME/.claude/projects/-$(_chezmoi_projects_prefix)-${PROJ}/memory"
 add_file "$memory_dir/MEMORY.md" "# ${PROJ} — Project Memory
 
 ## Architecture Decisions

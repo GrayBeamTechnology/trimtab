@@ -7,6 +7,8 @@
 #   Here we accumulate git/session/memory signals → extract a briefing
 set -uo pipefail
 
+source "$(dirname "$0")/trimtab-portable.sh"
+
 R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
 B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
 A=$'\033[0;33m'   N=$'\033[0m'
@@ -14,6 +16,7 @@ A=$'\033[0;33m'   N=$'\033[0m'
 PROJECTS_DIR="$HOME/1-Projects"
 SINCE="24h"
 AI_MODE=false
+CHEZMOI_PREFIX=$(_chezmoi_projects_prefix)
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -93,7 +96,7 @@ section "Active Sessions"
 found_claude=0
 while IFS= read -r pid; do
   [[ -z "$pid" ]] && continue
-  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+  cwd=$(_proc_cwd "$pid") || continue
   proj=$(basename "$cwd")
   elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
   printf "  ${G}●${N} %-22s ${D}%s${N}\n" "$proj" "$elapsed"
@@ -108,16 +111,15 @@ done < <(pgrep -x claude 2>/dev/null || true)
 # ============================================================
 section "Memory Changes (since $SINCE)"
 found_memory=0
+threshold=$(_date_ago "$GIT_SINCE")
 
 # Check global memory
-global_memory="$HOME/.claude/projects/-home-mchughson-1-Projects/memory"
+global_memory="$HOME/.claude/projects/-${CHEZMOI_PREFIX}/memory"
 if [[ -d "$global_memory" ]]; then
   while IFS= read -r memfile; do
     [[ -z "$memfile" ]] && continue
     fname=$(basename "$memfile")
-    mod=$(stat -c '%Y' "$memfile" 2>/dev/null || echo 0)
-    # Convert SINCE to seconds for comparison
-    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    mod=$(_mtime "$memfile")
     if (( mod > threshold )); then
       printf "  ${A}●${N} global/%s ${D}(modified)${N}\n" "$fname"
       add_obs "MEMORY: global/$fname updated"
@@ -127,14 +129,13 @@ if [[ -d "$global_memory" ]]; then
 fi
 
 # Check per-project memory
-for memdir in "$HOME"/.claude/projects/-home-mchughson-1-Projects-*/memory; do
+for memdir in "$HOME"/.claude/projects/-"${CHEZMOI_PREFIX}"-*/memory; do
   [[ -d "$memdir" ]] || continue
-  proj=$(basename "$(dirname "$memdir")" | sed 's/-home-mchughson-1-Projects-//')
+  proj=$(basename "$(dirname "$memdir")" | sed "s/-${CHEZMOI_PREFIX}-//")
   while IFS= read -r memfile; do
     [[ -z "$memfile" ]] && continue
     fname=$(basename "$memfile")
-    mod=$(stat -c '%Y' "$memfile" 2>/dev/null || echo 0)
-    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    mod=$(_mtime "$memfile")
     if (( mod > threshold )); then
       printf "  ${A}●${N} %s/%s ${D}(modified)${N}\n" "$proj" "$fname"
       add_obs "MEMORY: $proj/$fname updated"
@@ -157,8 +158,7 @@ for proj_dir in "$PROJECTS_DIR"/*/; do
 
   for cfg in "$proj_dir/CLAUDE.md" "$proj_dir/.claude/settings.json" "$proj_dir/.claude/settings.local.json"; do
     [[ -f "$cfg" ]] || continue
-    mod=$(stat -c '%Y' "$cfg" 2>/dev/null || echo 0)
-    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    mod=$(_mtime "$cfg")
     if (( mod > threshold )); then
       cfgname=$(basename "$cfg")
       printf "  ${Y}●${N} %s/%s ${D}(modified)${N}\n" "$proj" "$cfgname"
@@ -170,8 +170,7 @@ done
 
 # Check global CLAUDE.md
 if [[ -f "$HOME/.claude/CLAUDE.md" ]]; then
-  mod=$(stat -c '%Y' "$HOME/.claude/CLAUDE.md" 2>/dev/null || echo 0)
-  threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+  mod=$(_mtime "$HOME/.claude/CLAUDE.md")
   if (( mod > threshold )); then
     printf "  ${Y}●${N} ~/.claude/CLAUDE.md ${D}(global config modified)${N}\n"
     add_obs "CONFIG: global CLAUDE.md changed"
@@ -208,8 +207,7 @@ lessons_found=0
 for proj_dir in "$PROJECTS_DIR"/*/; do
   [[ -f "$proj_dir/CLAUDE.md" ]] || continue
   proj=$(basename "$proj_dir")
-  mod=$(stat -c '%Y' "$proj_dir/CLAUDE.md" 2>/dev/null || echo 0)
-  threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+  mod=$(_mtime "$proj_dir/CLAUDE.md")
   (( mod <= threshold )) && continue
 
   extracted=$(awk '
@@ -226,13 +224,12 @@ for proj_dir in "$PROJECTS_DIR"/*/; do
 done
 
 # Extract from recently modified memory files
-for memdir in "$HOME"/.claude/projects/-home-mchughson-1-Projects-*/memory; do
+for memdir in "$HOME"/.claude/projects/-"${CHEZMOI_PREFIX}"-*/memory; do
   [[ -d "$memdir" ]] || continue
-  proj=$(basename "$(dirname "$memdir")" | sed 's/-home-mchughson-1-Projects-//')
+  proj=$(basename "$(dirname "$memdir")" | sed "s/-${CHEZMOI_PREFIX}-//")
   for md_file in "$memdir"/*.md; do
     [[ -f "$md_file" ]] || continue
-    mod=$(stat -c '%Y' "$md_file" 2>/dev/null || echo 0)
-    threshold=$(date -d "$GIT_SINCE" +%s 2>/dev/null || date -d "24 hours ago" +%s)
+    mod=$(_mtime "$md_file")
     (( mod <= threshold )) && continue
 
     extracted=$(awk '
