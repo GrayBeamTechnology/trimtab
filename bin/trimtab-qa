@@ -1,0 +1,822 @@
+#!/usr/bin/env bash
+# trimtab qa — containerized persona-driven QA runner
+#
+# Subcommands:
+#   run <persona...> [--scenarios 1,3,5] [--rebuild] [--agent goose]
+#   run --all [--live <url>]   Run all personas in parallel
+#   build          Build app + qa-agent images
+#   list           List available persona files
+#   report [--latest]  List/show QA reports
+set -euo pipefail
+
+# Resolve symlinks to find the real script dir (where trimtab-portable.sh lives)
+_resolve_dir() {
+  local src="$1"
+  while [[ -L "$src" ]]; do
+    local dir; dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR=$(_resolve_dir "$0")
+
+source "$SCRIPT_DIR/trimtab-portable.sh"
+source "$SCRIPT_DIR/trimtab-common.sh"
+
+# Alias: trimtab-qa uses die() throughout, common.sh provides err()
+die() { err "$1"; }
+
+# --- Compose template location ---
+COMPOSE_TEMPLATE="${COMPOSE_TEMPLATE:-$HOME/1-Projects/ai-qa-forge/compose/podman-compose.qa.yml}"
+
+# --- Simple TOML parser (flat key=value under [sections]) ---
+# Usage: toml_get <file> <section> <key> [default]
+toml_get() {
+  local file="$1" section="$2" key="$3" default="${4:-}"
+  local in_section=false value=""
+
+  while IFS= read -r line; do
+    # Strip comments and whitespace
+    line="${line%%#*}"
+    line="${line## }"
+    line="${line%% }"
+    [[ -z "$line" ]] && continue
+
+    # Section header
+    if [[ "$line" =~ ^\[([a-zA-Z_]+)\] ]]; then
+      [[ "${BASH_REMATCH[1]}" == "$section" ]] && in_section=true || in_section=false
+      continue
+    fi
+
+    # Key = value (within target section)
+    if $in_section && [[ "$line" =~ ^${key}[[:space:]]*=[[:space:]]*(.+) ]]; then
+      value="${BASH_REMATCH[1]}"
+      # Strip surrounding quotes
+      value="${value#\"}"
+      value="${value%\"}"
+      echo "$value"
+      return 0
+    fi
+  done < "$file"
+
+  echo "$default"
+}
+
+# --- Auto-detect project config from mix.exs ---
+auto_detect_mix() {
+  local mix_file="$1"
+  [[ -f "$mix_file" ]] || return 1
+
+  local app_name
+  app_name=$(grep -oP 'app:\s*:\K\w+' "$mix_file" 2>/dev/null || true)
+  [[ -z "$app_name" ]] && return 1
+
+  # Export detected values (caller can override with qa.toml)
+  _APP_NAME="$app_name"
+  _BIN_NAME="$app_name"
+  _IMAGE_NAME="${app_name}:qa"
+
+  # Try to detect release module
+  local release_mod
+  release_mod=$(grep -oP 'defmodule\s+\K[\w.]+(?=\.Release)' lib/**/release.ex 2>/dev/null | head -1 || true)
+  [[ -n "$release_mod" ]] && _RELEASE_MODULE="${release_mod}.Release"
+
+  return 0
+}
+
+# --- Load config: qa.toml > auto-detect > defaults ---
+load_config() {
+  local project_dir="$1"
+
+  # Defaults
+  _APP_NAME=""
+  _BIN_NAME=""
+  _IMAGE_NAME=""
+  _RELEASE_MODULE="App.Release"
+  _APP_PORT="4005"
+  _HEALTH_PATH="/health"
+  _DB_NAME=""
+  _DOCKERFILE="Dockerfile"
+  _QA_AGENT="claude"
+  _PERSONA_DIR="docs/personas"
+  _REPORT_DIR="docs/qa-reports"
+  _APP_TIMEOUT="120"
+
+  # Try auto-detect from mix.exs
+  auto_detect_mix "$project_dir/mix.exs" 2>/dev/null || true
+
+  # Override with qa.toml if present
+  local toml="$project_dir/qa.toml"
+  if [[ -f "$toml" ]]; then
+    ok "config: qa.toml"
+    local v
+    v=$(toml_get "$toml" app name ""); [[ -n "$v" ]] && _APP_NAME="$v"
+    v=$(toml_get "$toml" app bin_name ""); [[ -n "$v" ]] && _BIN_NAME="$v"
+    v=$(toml_get "$toml" app release_module ""); [[ -n "$v" ]] && _RELEASE_MODULE="$v"
+    v=$(toml_get "$toml" app port ""); [[ -n "$v" ]] && _APP_PORT="$v"
+    v=$(toml_get "$toml" app health_path ""); [[ -n "$v" ]] && _HEALTH_PATH="$v"
+    v=$(toml_get "$toml" app db_name ""); [[ -n "$v" ]] && _DB_NAME="$v"
+    v=$(toml_get "$toml" build dockerfile ""); [[ -n "$v" ]] && _DOCKERFILE="$v"
+    v=$(toml_get "$toml" build image_name ""); [[ -n "$v" ]] && _IMAGE_NAME="$v"
+    v=$(toml_get "$toml" agent default ""); [[ -n "$v" ]] && _QA_AGENT="$v"
+    v=$(toml_get "$toml" qa persona_dir ""); [[ -n "$v" ]] && _PERSONA_DIR="$v"
+    v=$(toml_get "$toml" qa report_dir ""); [[ -n "$v" ]] && _REPORT_DIR="$v"
+    v=$(toml_get "$toml" qa app_timeout ""); [[ -n "$v" ]] && _APP_TIMEOUT="$v"
+  elif [[ -n "$_APP_NAME" ]]; then
+    ok "config: auto-detected from mix.exs (${_APP_NAME})"
+  fi
+
+  # Derive defaults from app name
+  [[ -z "$_BIN_NAME" ]] && _BIN_NAME="$_APP_NAME"
+  [[ -z "$_IMAGE_NAME" ]] && _IMAGE_NAME="${_APP_NAME}:qa"
+  [[ -z "$_DB_NAME" ]] && _DB_NAME="${_APP_NAME}_qa"
+
+  # In strict mode (default), require app name
+  if [[ "${2:-}" != "--soft" && -z "$_APP_NAME" ]]; then
+    die "no qa.toml and could not auto-detect from mix.exs"
+  fi
+}
+
+# --- Validate prerequisites ---
+# Usage: check_prereqs [--live]
+check_prereqs() {
+  command -v podman >/dev/null 2>&1 || die "podman not found — install podman first"
+  if [[ "${1:-}" != "--live" ]]; then
+    command -v podman-compose >/dev/null 2>&1 || die "podman-compose not found — pip install podman-compose"
+    [[ -f "$COMPOSE_TEMPLATE" ]] || die "compose template not found: $COMPOSE_TEMPLATE"
+  fi
+}
+
+# --- Check auth ---
+check_auth() {
+  local agent="${1:-claude}"
+  case "$agent" in
+    claude)
+      if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        ok "auth: API key (ANTHROPIC_API_KEY)"
+      elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
+        ok "auth: OAuth (~/.claude/.credentials.json)"
+      else
+        warn "no Claude auth found"
+        echo "    Set ANTHROPIC_API_KEY or ensure ~/.claude/.credentials.json exists"
+        return 1
+      fi
+      ;;
+    goose)
+      if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+        ok "auth: API key (OPENAI_API_KEY)"
+      else
+        warn "no Goose auth found — set OPENAI_API_KEY"
+        return 1
+      fi
+      ;;
+  esac
+}
+
+# --- Build app image ---
+build_app_image() {
+  local project_dir="$1"
+  local dockerfile="${project_dir}/${_DOCKERFILE}"
+
+  [[ -f "$dockerfile" ]] || die "Dockerfile not found: $dockerfile"
+
+  echo "  building ${_IMAGE_NAME}..."
+  podman build -t "$_IMAGE_NAME" -f "$dockerfile" "$project_dir"
+  ok "app image: ${_IMAGE_NAME}"
+}
+
+# --- Build qa-agent image ---
+build_qa_agent() {
+  local agent_dir="$HOME/1-Projects/trimtab/containers/qa-agent"
+  [[ -d "$agent_dir" ]] || die "qa-agent Containerfile not found: $agent_dir"
+
+  echo "  building trimtab-qa-agent..."
+  podman build -t trimtab-qa-agent "$agent_dir"
+  ok "qa-agent image: trimtab-qa-agent"
+}
+
+# --- Check if image exists ---
+image_exists() {
+  podman image exists "$1" 2>/dev/null
+}
+
+# ============================================================
+# run_single_persona — compose-based QA (db + app + agent)
+# ============================================================
+# Runs in a subshell so env exports don't leak between parallel runs.
+# Args: <persona> <project_dir> <persona_dir> <scenarios> <rebuild>
+run_single_persona() {
+  local persona="$1" project_dir="$2" persona_dir="$3" scenarios="$4" rebuild="$5"
+  local persona_slug
+  persona_slug=$(basename "$persona" .md)
+
+  # Per-persona compose project name for pod isolation
+  local compose_project="qa-${persona_slug}"
+  local db_name="${_DB_NAME}_${persona_slug//-/_}"
+
+  # Ensure report dir exists
+  mkdir -p "${project_dir}/${_REPORT_DIR}"
+
+  # Build images (safe to call from multiple subshells — podman locks internally)
+  if [[ "$rebuild" == "true" ]] || ! image_exists "$_IMAGE_NAME"; then
+    build_app_image "$project_dir"
+  else
+    ok "app image: ${_IMAGE_NAME} (cached)"
+  fi
+
+  if [[ "$rebuild" == "true" ]] || ! image_exists "trimtab-qa-agent"; then
+    build_qa_agent
+  else
+    ok "qa-agent image: trimtab-qa-agent (cached)"
+  fi
+
+  # Export env vars for compose
+  export APP_IMAGE="$_IMAGE_NAME"
+  export APP_BIN_NAME="$_BIN_NAME"
+  export APP_RELEASE_MODULE="$_RELEASE_MODULE"
+  export APP_PORT="$_APP_PORT"
+  export APP_DB_NAME="$db_name"
+  export HEALTH_PATH="$_HEALTH_PATH"
+  export PERSONA_FILE="$persona"
+  export QA_AGENT="$_QA_AGENT"
+  export SCENARIOS="${scenarios}"
+  export PERSONA_DIR="${persona_dir}"
+  export REPORT_DIR="${project_dir}/${_REPORT_DIR}"
+  export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+
+  if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+    export CLAUDE_CREDENTIALS="$HOME/.claude/.credentials.json"
+  fi
+
+  local exit_code=0
+  podman-compose -f "$COMPOSE_TEMPLATE" -p "$compose_project" up --abort-on-container-exit || exit_code=$?
+
+  # Cleanup
+  podman-compose -f "$COMPOSE_TEMPLATE" -p "$compose_project" down 2>/dev/null || true
+
+  return $exit_code
+}
+
+# ============================================================
+# run_single_persona_live — agent-only against a live URL
+# ============================================================
+# Args: <persona> <project_dir> <persona_dir> <scenarios> <live_url> <rebuild>
+run_single_persona_live() {
+  local persona="$1" project_dir="$2" persona_dir="$3" scenarios="$4" live_url="$5" rebuild="$6"
+
+  # Build qa-agent image if needed
+  if [[ "$rebuild" == "true" ]] || ! image_exists "trimtab-qa-agent"; then
+    build_qa_agent
+  else
+    ok "qa-agent image: trimtab-qa-agent (cached)"
+  fi
+
+  # Ensure report dir exists
+  mkdir -p "${project_dir}/${_REPORT_DIR}"
+
+  local run_args=(
+    --rm --network host
+    -e "APP_URL=${live_url}"
+    -e "PERSONA_FILE=${persona}"
+    -e "QA_AGENT=${_QA_AGENT}"
+    -e "SCENARIOS=${scenarios}"
+    -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
+    -e "OPENAI_API_KEY=${OPENAI_API_KEY:-}"
+    -v "${persona_dir}:/personas:ro,Z"
+    -v "${project_dir}/${_REPORT_DIR}:/reports:Z"
+  )
+
+  if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+    run_args+=(-v "$HOME/.claude/.credentials.json:/auth/.credentials.json:ro,Z")
+  fi
+
+  local exit_code=0
+  podman run "${run_args[@]}" trimtab-qa-agent "$persona" || exit_code=$?
+
+  return $exit_code
+}
+
+# ============================================================
+# generate_consolidated_report — cross-persona summary
+# ============================================================
+# Args: <report_dir> <app_name> <persona1> [persona2 ...]
+generate_consolidated_report() {
+  local report_dir="$1" app_name="$2"
+  shift 2
+  local personas=("$@")
+
+  local timestamp
+  timestamp=$(date +%Y%m%d-%H%M%S)
+  local datestamp
+  datestamp=$(date +%Y-%m-%d)
+  local outfile="${report_dir}/consolidated-${timestamp}.md"
+
+  local total_pass=0 total_fail=0 total_skip=0
+  local table_rows="" failed_sections="" report_links=""
+  local any_fail=false
+
+  for persona in "${personas[@]}"; do
+    local slug
+    slug=$(basename "$persona" .md)
+
+    # Find most recent report for this persona
+    local latest_report=""
+    latest_report=$(ls -t "${report_dir}"/${slug}-report-*.md 2>/dev/null | head -1 || true)
+
+    local pass=0 fail=0 skip=0 status="NO REPORT"
+
+    if [[ -n "$latest_report" && -f "$latest_report" ]]; then
+      pass=$(grep -c '— PASS' "$latest_report" 2>/dev/null || true)
+      fail=$(grep -c '— FAIL' "$latest_report" 2>/dev/null || true)
+      skip=$(grep -c '— SKIP' "$latest_report" 2>/dev/null || true)
+
+      total_pass=$((total_pass + pass))
+      total_fail=$((total_fail + fail))
+      total_skip=$((total_skip + skip))
+
+      if (( fail > 0 )); then
+        status="FAIL"
+        any_fail=true
+        # Extract failed scenario blocks
+        failed_sections+=$'\n'"#### ${slug}"$'\n'
+        # Grab lines from "— FAIL" back to the nearest "### Scenario" header
+        local in_fail=false scenario_header=""
+        while IFS= read -r line; do
+          if [[ "$line" =~ ^###\ Scenario ]]; then
+            scenario_header="$line"
+            in_fail=false
+          fi
+          if [[ "$line" == *"— FAIL"* ]]; then
+            in_fail=true
+            [[ -n "$scenario_header" ]] && failed_sections+="${scenario_header}"$'\n'
+          fi
+          if $in_fail; then
+            [[ "$line" != "$scenario_header" ]] && failed_sections+="${line}"$'\n'
+            # Stop at next scenario header or end of section
+            if [[ "$line" =~ ^###\ Scenario ]] && [[ "$line" != "$scenario_header" ]]; then
+              in_fail=false
+            fi
+          fi
+        done < "$latest_report"
+      else
+        status="PASS"
+      fi
+
+      report_links+="- $(basename "$latest_report")"$'\n'
+    else
+      report_links+="- ${slug}: NO REPORT FOUND"$'\n'
+      any_fail=true
+    fi
+
+    table_rows+="| ${slug} | ${pass} | ${fail} | ${skip} | ${status} |"$'\n'
+  done
+
+  # Write consolidated report
+  cat > "$outfile" <<EOF
+# Consolidated QA Report — ${datestamp}
+
+**Personas:** ${#personas[@]}  |  **App:** ${app_name}
+
+## Cross-Persona Summary
+
+| Persona | PASS | FAIL | SKIP | Status |
+|---------|------|------|------|--------|
+${table_rows}
+**Totals:** ${total_pass} PASS / ${total_fail} FAIL / ${total_skip} SKIP
+EOF
+
+  if [[ -n "$failed_sections" ]]; then
+    cat >> "$outfile" <<EOF
+
+## Failed Scenarios (All Personas)
+${failed_sections}
+EOF
+  fi
+
+  cat >> "$outfile" <<EOF
+
+## Individual Reports
+${report_links}
+EOF
+
+  ok "consolidated report: ${outfile}"
+}
+
+# ============================================================
+# run_parallel_personas — orchestrate multiple persona runs
+# ============================================================
+# Args: <project_dir> <persona_dir> <scenarios> <rebuild> <live_url> <persona1> [persona2 ...]
+run_parallel_personas() {
+  local project_dir="$1" persona_dir="$2" scenarios="$3" rebuild="$4" live_url="$5"
+  shift 5
+  local personas=("$@")
+
+  local pids=() names=() logfiles=()
+  local log_base="${project_dir}/${_REPORT_DIR}"
+  mkdir -p "$log_base"
+
+  section "Parallel QA (${#personas[@]} personas)"
+
+  for persona in "${personas[@]}"; do
+    local slug
+    slug=$(basename "$persona" .md)
+    local logfile="${log_base}/.qa-run-${slug}.log"
+    logfiles+=("$logfile")
+    names+=("$slug")
+
+    echo "  launching: ${slug}"
+
+    if [[ -n "$live_url" ]]; then
+      ( run_single_persona_live "$persona" "$project_dir" "$persona_dir" "$scenarios" "$live_url" "$rebuild" ) > "$logfile" 2>&1 &
+    else
+      ( run_single_persona "$persona" "$project_dir" "$persona_dir" "$scenarios" "$rebuild" ) > "$logfile" 2>&1 &
+    fi
+
+    pids+=($!)
+  done
+
+  echo ""
+  echo "  ${D}waiting for all runs to complete...${N}"
+
+  # Wait and collect results
+  local all_passed=true
+  local exit_codes=()
+  for i in "${!pids[@]}"; do
+    local ec=0
+    wait "${pids[$i]}" || ec=$?
+    exit_codes+=($ec)
+    if (( ec != 0 )); then
+      all_passed=false
+    fi
+  done
+
+  # Print per-persona results
+  echo ""
+  section "Results"
+  for i in "${!names[@]}"; do
+    if (( exit_codes[$i] == 0 )); then
+      ok "${names[$i]}: PASS"
+    else
+      echo "  ${R}✗${N} ${names[$i]}: FAIL (exit ${exit_codes[$i]})"
+      echo "    ${D}log: ${logfiles[$i]}${N}"
+    fi
+  done
+
+  # Generate consolidated report
+  echo ""
+  section "Consolidated Report"
+  generate_consolidated_report "${project_dir}/${_REPORT_DIR}" "$_APP_NAME" "${personas[@]}"
+
+  # Clean up log files for successful runs
+  for i in "${!names[@]}"; do
+    if (( exit_codes[$i] == 0 )); then
+      rm -f "${logfiles[$i]}"
+    fi
+  done
+
+  if $all_passed; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# ============================================================
+# SUBCOMMAND: run
+# ============================================================
+cmd_run() {
+  local personas=() scenarios="" rebuild=false agent="" live_url="" run_all=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scenarios)   scenarios="$2"; shift 2 ;;
+      --scenarios=*) scenarios="${1#*=}"; shift ;;
+      --rebuild)     rebuild=true; shift ;;
+      --agent)       agent="$2"; shift 2 ;;
+      --agent=*)     agent="${1#*=}"; shift ;;
+      --live)        live_url="$2"; shift 2 ;;
+      --live=*)      live_url="${1#*=}"; shift ;;
+      --all)         run_all=true; shift ;;
+      -h|--help)
+        cat <<EOF
+trimtab qa run — run persona QA against a containerized or live app
+
+Usage:
+  trimtab qa run <persona> [options]
+  trimtab qa run <persona1> <persona2> ... [options]
+  trimtab qa run --all [options]
+
+Arguments:
+  persona             One or more persona filenames (e.g., rachel-kim or rachel-kim.md)
+  --all               Run all personas in the persona directory
+
+Options:
+  --scenarios 1,3,5   Only run specific scenario numbers
+  --rebuild           Force rebuild of app and qa-agent images
+  --agent goose       Override default agent (claude, goose)
+  --live <url>        Skip containerized app — run qa-agent against a live URL
+
+Examples:
+  trimtab qa run rachel-kim
+  trimtab qa run rachel-kim corrina-li new-user-alex
+  trimtab qa run --all
+  trimtab qa run rachel-kim --live http://localhost:4002
+  trimtab qa run --all --live https://app.example.com
+  trimtab qa run --all --live http://localhost:4002 --agent goose --rebuild
+EOF
+        return 0
+        ;;
+      --*) warn "unknown flag: $1"; shift ;;
+      *)   personas+=("$1"); shift ;;
+    esac
+  done
+
+  local project_dir
+  project_dir=$(pwd)
+
+  # Load config
+  if [[ -n "$live_url" ]]; then
+    load_config "$project_dir" --soft
+  else
+    load_config "$project_dir"
+  fi
+  [[ -n "$agent" ]] && _QA_AGENT="$agent"
+
+  # Resolve persona directory
+  local persona_dir="${project_dir}/${_PERSONA_DIR}"
+
+  # Handle --all: discover all *.md files in persona dir
+  if $run_all; then
+    [[ -d "$persona_dir" ]] || die "persona directory not found: ${persona_dir}"
+    for f in "$persona_dir"/*.md; do
+      [[ -f "$f" ]] || continue
+      personas+=("$(basename "$f")")
+    done
+    (( ${#personas[@]} == 0 )) && die "no persona files found in ${persona_dir}"
+  fi
+
+  (( ${#personas[@]} == 0 )) && die "usage: trimtab qa run <persona> [options]  (or use --all)"
+
+  # Normalize: add .md extension if missing
+  for i in "${!personas[@]}"; do
+    [[ "${personas[$i]}" == *.md ]] || personas[$i]="${personas[$i]}.md"
+  done
+
+  # Display header
+  section "trimtab qa run"
+  echo "  project:  $(basename "$project_dir")"
+  if (( ${#personas[@]} == 1 )); then
+    echo "  persona:  ${personas[0]}"
+  else
+    echo "  personas: ${#personas[@]} (${personas[*]})"
+  fi
+  echo "  agent:    ${_QA_AGENT}"
+  if [[ -n "$live_url" ]]; then
+    echo "  mode:     live → ${live_url}"
+  else
+    echo "  mode:     containerized"
+    echo "  app:      ${_IMAGE_NAME}"
+  fi
+
+  # Check prereqs
+  if [[ -n "$live_url" ]]; then
+    check_prereqs --live
+  else
+    check_prereqs
+  fi
+  check_auth "$_QA_AGENT" || die "auth required — see above"
+
+  # Validate persona files exist
+  for persona in "${personas[@]}"; do
+    [[ -f "${persona_dir}/${persona}" ]] || die "persona not found: ${persona_dir}/${persona}"
+  done
+  ok "personas validated (${#personas[@]})"
+
+  # Ensure report dir exists
+  mkdir -p "${project_dir}/${_REPORT_DIR}"
+
+  # Dispatch
+  local exit_code=0
+
+  if (( ${#personas[@]} == 1 )); then
+    # --- Single persona ---
+    local persona="${personas[0]}"
+
+    if [[ -n "$live_url" ]]; then
+      section "QA Run (live)"
+      echo "  target: ${live_url}"
+      echo ""
+      run_single_persona_live "$persona" "$project_dir" "$persona_dir" "$scenarios" "$live_url" "$rebuild" || exit_code=$?
+    else
+      section "Images"
+      if $rebuild || ! image_exists "$_IMAGE_NAME"; then
+        build_app_image "$project_dir"
+      else
+        ok "app image: ${_IMAGE_NAME} (cached)"
+      fi
+      if $rebuild || ! image_exists "trimtab-qa-agent"; then
+        build_qa_agent
+      else
+        ok "qa-agent image: trimtab-qa-agent (cached)"
+      fi
+
+      section "QA Run"
+      echo "  compose: ${COMPOSE_TEMPLATE}"
+      echo ""
+      run_single_persona "$persona" "$project_dir" "$persona_dir" "$scenarios" "$rebuild" || exit_code=$?
+    fi
+
+    echo ""
+    if (( exit_code == 0 )); then
+      section "Complete"
+      ok "reports: ${project_dir}/${_REPORT_DIR}/"
+    else
+      section "Failed"
+      echo "  ${R}QA run exited with code ${exit_code}${N}"
+      echo "  reports: ${project_dir}/${_REPORT_DIR}/"
+    fi
+  else
+    # --- Multiple personas (parallel) ---
+    if [[ -z "$live_url" ]]; then
+      section "Images"
+      if $rebuild || ! image_exists "$_IMAGE_NAME"; then
+        build_app_image "$project_dir"
+      else
+        ok "app image: ${_IMAGE_NAME} (cached)"
+      fi
+      if $rebuild || ! image_exists "trimtab-qa-agent"; then
+        build_qa_agent
+      else
+        ok "qa-agent image: trimtab-qa-agent (cached)"
+      fi
+    fi
+
+    run_parallel_personas "$project_dir" "$persona_dir" "$scenarios" "$rebuild" "$live_url" "${personas[@]}" || exit_code=$?
+
+    echo ""
+    if (( exit_code == 0 )); then
+      section "All Personas Complete"
+      ok "reports: ${project_dir}/${_REPORT_DIR}/"
+    else
+      section "Some Personas Failed"
+      echo "  ${R}One or more QA runs failed — see individual logs above${N}"
+      echo "  reports: ${project_dir}/${_REPORT_DIR}/"
+    fi
+  fi
+
+  return $exit_code
+}
+
+# ============================================================
+# SUBCOMMAND: build
+# ============================================================
+cmd_build() {
+  local project_dir
+  project_dir=$(pwd)
+
+  section "trimtab qa build"
+  load_config "$project_dir"
+
+  check_prereqs
+
+  section "App Image"
+  build_app_image "$project_dir"
+
+  section "QA Agent Image"
+  build_qa_agent
+
+  echo ""
+  ok "all images built"
+}
+
+# ============================================================
+# SUBCOMMAND: list
+# ============================================================
+cmd_list() {
+  local project_dir
+  project_dir=$(pwd)
+
+  load_config "$project_dir" --soft
+
+  local persona_dir="${project_dir}/${_PERSONA_DIR}"
+
+  section "Personas"
+  if [[ ! -d "$persona_dir" ]]; then
+    echo "  ${D}no persona dir: ${persona_dir}${N}"
+    return 0
+  fi
+
+  local count=0
+  for f in "$persona_dir"/*.md; do
+    [[ -f "$f" ]] || continue
+    local name
+    name=$(basename "$f")
+    # Try to extract persona display name from first heading
+    local display
+    display=$(grep -m1 '^# ' "$f" 2>/dev/null | sed 's/^# //' || true)
+    if [[ -n "$display" ]]; then
+      printf "  ${G}●${N} %-30s %s\n" "$name" "${D}${display}${N}"
+    else
+      printf "  ${G}●${N} %s\n" "$name"
+    fi
+    count=$((count + 1))
+  done
+
+  (( count == 0 )) && echo "  ${D}no persona files in ${persona_dir}${N}"
+  echo ""
+  echo "  ${D}${count} persona(s)${N}"
+}
+
+# ============================================================
+# SUBCOMMAND: report
+# ============================================================
+cmd_report() {
+  local latest=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --latest) latest=true; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  local project_dir
+  project_dir=$(pwd)
+
+  load_config "$project_dir" --soft
+
+  local report_dir="${project_dir}/${_REPORT_DIR}"
+
+  if [[ ! -d "$report_dir" ]]; then
+    echo "  ${D}no reports dir: ${report_dir}${N}"
+    return 0
+  fi
+
+  if $latest; then
+    # Show most recent report
+    local latest_file
+    latest_file=$(ls -t "$report_dir"/*-report-*.md 2>/dev/null | head -1)
+    if [[ -z "$latest_file" ]]; then
+      echo "  ${D}no reports found${N}"
+      return 0
+    fi
+    section "Latest Report: $(basename "$latest_file")"
+    cat "$latest_file"
+  else
+    # List all reports
+    section "QA Reports"
+    local count=0
+    for f in $(ls -t "$report_dir"/*-report-*.md 2>/dev/null); do
+      local name size date_str
+      name=$(basename "$f")
+      size=$(stat -c '%s' "$f" 2>/dev/null || stat -f '%z' "$f" 2>/dev/null || echo "?")
+      date_str=$(stat -c '%y' "$f" 2>/dev/null | cut -d. -f1 || stat -f '%Sm' "$f" 2>/dev/null || echo "?")
+      printf "  ${G}●${N} %-45s ${D}%s  %s bytes${N}\n" "$name" "$date_str" "$size"
+      count=$((count + 1))
+    done
+
+    (( count == 0 )) && echo "  ${D}no reports found in ${report_dir}${N}"
+    echo ""
+    echo "  ${D}${count} report(s)${N}"
+  fi
+}
+
+# ============================================================
+# DISPATCH
+# ============================================================
+case "${1:-help}" in
+  -h|--help|help)
+    cat <<EOF
+${B}trimtab qa${N} — containerized persona-driven QA runner
+
+Usage: trimtab qa <command> [args...]
+
+Commands:
+  run <persona...>   Run QA for one or more personas (parallel when multiple)
+  run --all          Run all personas in the persona directory
+  build              Build app + qa-agent container images
+  list               List available persona files
+  report             List/show QA reports
+
+Run options:
+  --all              Discover and run all personas
+  --live <url>       Skip containers — run agent against a live app URL
+  --scenarios 1,3,5  Only run specific scenario numbers
+  --rebuild          Force rebuild of images
+  --agent goose      Override default agent (claude, goose)
+
+Reads qa.toml from the current directory, or auto-detects from mix.exs.
+EOF
+    ;;
+  run)    shift; cmd_run "$@" ;;
+  build)  shift; cmd_build ;;
+  list)   shift; cmd_list ;;
+  report) shift; cmd_report "$@" ;;
+  *)
+    echo "trimtab qa: unknown command '${1}'" >&2
+    echo "Run 'trimtab qa help' for usage." >&2
+    exit 1
+    ;;
+esac

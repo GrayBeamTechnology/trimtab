@@ -57,8 +57,14 @@ detect_agent() {
   case "$QA_AGENT" in
     claude)
       command -v claude >/dev/null 2>&1 || die "claude not found in PATH"
-      [[ -n "${ANTHROPIC_API_KEY:-}" ]] || echo "${Y}warn:${N} ANTHROPIC_API_KEY not set — claude may fail" >&2
-      ok "agent: Claude Code"
+      if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        ok "agent: Claude Code (API key)"
+      elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
+        ok "agent: Claude Code (OAuth)"
+      else
+        echo "${Y}warn:${N} no Claude auth found — set ANTHROPIC_API_KEY or mount .credentials.json to /auth/" >&2
+        ok "agent: Claude Code (no auth — may fail)"
+      fi
       ;;
     goose)
       command -v goose >/dev/null 2>&1 || die "goose not found in PATH"

@@ -1,19 +1,23 @@
 # trimtab-qa-agent — agent-agnostic QA runner with browser automation
 #
 # Build:  podman build -t trimtab-qa-agent containers/qa-agent/
-# Run:    podman run -it --rm --network host --userns=keep-id \
-#           -e QA_AGENT=claude \
-#           -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-#           -v ~/.claude:/home/agent/.claude:Z \
-#           -v ~/1-Projects/myapp/docs/personas:/personas:ro,Z \
-#           -v ~/1-Projects/myapp/docs/qa-reports:/reports:Z \
-#           trimtab-qa-agent rachel-kim.md
+#
+# Auth modes:
+#   API key:  podman run --rm -e ANTHROPIC_API_KEY=... trimtab-qa-agent ...
+#   OAuth:    podman run --rm -v ~/.claude/.credentials.json:/auth/.credentials.json:ro,Z ...
+#
+# Run example:
+#   podman run -it --rm --network host \
+#     -e QA_AGENT=claude \
+#     -v ~/.claude/.credentials.json:/auth/.credentials.json:ro,Z \
+#     -v ~/1-Projects/myapp/docs/personas:/personas:ro,Z \
+#     -v ~/1-Projects/myapp/docs/qa-reports:/reports:Z \
+#     trimtab-qa-agent rachel-kim.md
 #
 # Supports multiple AI agents (QA_AGENT env var):
 #   claude  — Claude Code CLI (default)
 #   goose   — Goose CLI by Block
 #
-# --userns=keep-id maps host UID to agent (1000) inside.
 # Volume :Z suffix needed on Fedora (SELinux). Omit on NixOS.
 #
 # Versions pinned for reproducibility. Update and rebuild to upgrade.
@@ -81,6 +85,16 @@ RUN usermod -l agent -d /home/agent -m node \
 
 USER agent
 
+# --- Pre-create writable dirs ---
+# ~/.claude will receive copied credentials at startup (entrypoint.sh)
+# /auth is the read-only mount point for host .credentials.json
+RUN mkdir -p /home/agent/.claude
+
+USER root
+RUN mkdir -p /auth /reports && chown agent:agent /reports
+
+USER agent
+
 # --- browser-use in isolated venv ---
 # browser-use is Python but encapsulated here — no Python in our stack.
 RUN python3 -m venv /home/agent/.venv \
@@ -97,5 +111,12 @@ ENV TERM=xterm-256color \
 COPY --chown=agent:agent qa-runner.sh /home/agent/qa-runner.sh
 RUN chmod +x /home/agent/qa-runner.sh
 
+# Root wrapper: copies auth credentials then drops to agent user.
+# Runs as root to chown the credential copy, then exec's qa-runner as agent.
+# Must switch to root BEFORE copying entrypoint (agent can't chmod /).
+USER root
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 WORKDIR /work
-ENTRYPOINT ["/home/agent/qa-runner.sh"]
+ENTRYPOINT ["/entrypoint.sh"]

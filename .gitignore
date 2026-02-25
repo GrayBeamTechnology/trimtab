@@ -4,5 +4,14 @@ dist/
 *.swp
 .env
 
+# Syncthing metadata
+.stfolder/
+
+# IDE settings
+.vscode/
+
+# Task Master scaffolding
+.taskmaster/
+
 # Local Netlify folder
 .netlify

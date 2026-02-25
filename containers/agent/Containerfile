@@ -1,12 +1,14 @@
 # trimtab-agent — self-contained Claude Code + Elixir dev environment
 #
 # Build:  podman build -t trimtab-agent containers/agent/
-# Run:    podman run -it --network host \
-#           -v ~/.claude:/root/.claude:Z \
+# Run:    podman run -it --rm --network host --userns=keep-id \
+#           -v ~/.claude:/home/agent/.claude:Z \
 #           -v ~/1-Projects/my-project:/work:Z \
-#           trimtab-agent -c 'claude'
+#           --entrypoint claude trimtab-agent --dangerously-skip-permissions
 #
-# In rootless podman, container root = your host user (no privilege escalation).
+# --userns=keep-id maps your host UID to the same UID inside (agent, 1000).
+# This lets --dangerously-skip-permissions work (Claude refuses it as root)
+# while keeping volume file ownership correct.
 # Volume :Z suffix needed on Fedora (SELinux). Omit on NixOS.
 #
 # Versions pinned for reproducibility. Update and rebuild to upgrade.
@@ -50,19 +52,25 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
     && apt-get install -y --no-install-recommends postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Claude Code ---
-RUN curl -fsSL https://claude.ai/install.sh | bash
+# --- Claude Code (install as root, copy to system path) ---
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && cp /root/.local/bin/claude /usr/local/bin/claude
+
+# --- Non-root user for agent work ---
+# UID 1000 matches typical host user for --userns=keep-id compatibility.
+# With --userns=keep-id, the host user maps to this UID inside the container.
+RUN useradd -m -u 1000 -s /bin/bash agent
+
+USER agent
+
+# --- Hex + Rebar (installed as agent user) ---
+RUN mix local.hex --force && mix local.rebar --force
 
 # --- Environment ---
-# PATH: claude lives in ~/.local/bin — must be set via ENV for non-interactive shells
 # TERM: Claude TUI needs a real terminal type
 # Auto-update: disabled — image pins the version, updates are lost on container restart
-ENV PATH="/root/.local/bin:${PATH}" \
-    TERM=xterm-256color \
+ENV TERM=xterm-256color \
     CLAUDE_CODE_DISABLE_AUTO_UPDATE=1
-
-# --- Hex + Rebar (Elixir build tools) ---
-RUN mix local.hex --force && mix local.rebar --force
 
 WORKDIR /work
 ENTRYPOINT ["/bin/bash"]
