@@ -3,20 +3,22 @@
 # Shows CLAUDE.md, memory files, skills, quality tools, and config drift
 set -euo pipefail
 
-source "$(dirname "$0")/trimtab-portable.sh"
-source "$(dirname "$0")/trimtab-common.sh"
+R=$'\033[0;31m'   G=$'\033[0;32m'   D=$'\033[2m'
+B=$'\033[1m'      C=$'\033[0;36m'   Y=$'\033[0;33m'
+A=$'\033[0;33m'   N=$'\033[0m'
 
-CHEZMOI_PREFIX=$(_chezmoi_projects_prefix)
+PROJECTS_DIR="$HOME/1-Projects"
 CMD="${1:-audit}"
-shift 2>/dev/null || true
+
+section() { printf "\n${B}${C}── %s${N}\n" "$1"; }
 
 # ============================================================
 # AUDIT — show trim tab infrastructure across all projects
 # ============================================================
 cmd_audit() {
   section "Trim Tab Infrastructure"
-  printf "  ${D}%-22s %s %s %s %s %s${N}\n" "PROJECT" "CLAUDE" "MEMORY" "SKILL" "TASKS" "GIT"
-  printf "  ${D}%-22s %s %s %s %s %s${N}\n" "───────" "──────" "──────" "─────" "─────" "───"
+  printf "  ${D}%-22s %s %s %s %s %s %s${N}\n" "PROJECT" "CLAUDE" "MEMORY" "SKILL" "TASKS" "GIT" "DESIGN"
+  printf "  ${D}%-22s %s %s %s %s %s %s${N}\n" "───────" "──────" "──────" "─────" "─────" "───" "──────"
 
   for proj_dir in "$PROJECTS_DIR"/*/; do
     [[ -d "$proj_dir" ]] || continue
@@ -37,7 +39,7 @@ cmd_audit() {
     fi
 
     # Memory files
-    memory_dir="$HOME/.claude/projects/-${CHEZMOI_PREFIX}-${proj}/memory"
+    memory_dir="$HOME/.claude/projects/-home-mchughson-1-Projects-${proj}/memory"
     if [[ -d "$memory_dir" ]]; then
       mcount=$(find "$memory_dir" -name "*.md" 2>/dev/null | wc -l)
       if (( mcount > 0 )); then
@@ -64,7 +66,15 @@ cmd_audit() {
       has_git="${G}yes${N}"
     fi
 
-    printf "  %-22s %s %s %s %s %s\n" "$proj" "$has_claude" "$has_memory" "$has_skills" "$has_tasks" "$has_git"
+    # Design system (graybeam-ui tokens)
+    has_design="  ${D}·${N} "
+    if [[ -d "$proj_dir/assets/vendor/graybeam-ui" ]]; then
+      has_design="${G}yes${N}  "
+    elif [[ ! -d "$proj_dir/assets" ]] && [[ ! -d "$proj_dir/src" ]]; then
+      has_design="${D}n/a${N}  "
+    fi
+
+    printf "  %-22s %s %s %s %s %s %s\n" "$proj" "$has_claude" "$has_memory" "$has_skills" "$has_tasks" "$has_git" "$has_design"
   done
 
   # Global trim tabs
@@ -74,7 +84,7 @@ cmd_audit() {
     printf "  ${G}●${N} ~/.claude/CLAUDE.md          ${D}(%d lines)${N}\n" "$lines"
   fi
 
-  global_memory="$HOME/.claude/projects/-${CHEZMOI_PREFIX}/memory"
+  global_memory="$HOME/.claude/projects/-home-mchughson-1-Projects/memory"
   if [[ -d "$global_memory" ]]; then
     mcount=$(find "$global_memory" -name "*.md" 2>/dev/null | wc -l)
     printf "  ${G}●${N} Global memory files           ${D}(%d files)${N}\n" "$mcount"
@@ -89,12 +99,53 @@ cmd_audit() {
     done < <(find "$HOME/.claude/skills" -name "SKILL.md" 2>/dev/null | sort)
   fi
 
-  # Global hooks
+  # Global hooks — enumerate each one
   if [[ -f "$HOME/.claude/settings.json" ]] && grep -q '"hooks"' "$HOME/.claude/settings.json" 2>/dev/null; then
-    printf "  ${G}●${N} Global Claude hooks           ${D}(active)${N}\n"
+    hook_count=$(python3 -c "
+import json, sys
+try:
+    data = json.load(open('$HOME/.claude/settings.json'))
+    hooks = data.get('hooks', {})
+    count = 0
+    for event, matchers in hooks.items():
+        for m in matchers:
+            for h in m.get('hooks', []):
+                count += 1
+    print(count)
+except: print(0)
+" 2>/dev/null)
+    printf "  ${G}●${N} Global Claude hooks           ${D}(%s hooks)${N}\n" "$hook_count"
+    python3 -c "
+import json, os
+try:
+    data = json.load(open('$HOME/.claude/settings.json'))
+    hooks = data.get('hooks', {})
+    for event, matchers in hooks.items():
+        for m in matchers:
+            tool = m.get('matcher', '?')
+            for h in m.get('hooks', []):
+                name = os.path.basename(h.get('command', '?')).replace('.sh','')
+                print(f'    {event}:{tool} → {name}')
+except: pass
+" 2>/dev/null
   else
     printf "  ${R}●${N} Global Claude hooks           ${D}(none)${N}\n"
   fi
+
+  # Check for project-level hook shadowing
+  local shadow_count=0
+  for proj_dir in "$PROJECTS_DIR"/*/; do
+    [[ -d "$proj_dir" ]] || continue
+    local proj_settings="$proj_dir/.claude/settings.json"
+    if [[ -f "$proj_settings" ]] && grep -q '"hooks"' "$proj_settings" 2>/dev/null; then
+      proj=$(basename "$proj_dir")
+      if (( shadow_count == 0 )); then
+        printf "\n  ${Y}⚠ Projects with local hook overrides:${N}\n"
+      fi
+      printf "    ${Y}●${N} %s\n" "$proj"
+      shadow_count=$((shadow_count + 1))
+    fi
+  done
 }
 
 # ============================================================
@@ -109,6 +160,8 @@ cmd_gaps() {
   local missing_credo=()
   local missing_precommit=()
   local missing_ci=()
+  local missing_design=()
+  local hook_shadows=()
 
   for proj_dir in "$PROJECTS_DIR"/*/; do
     [[ -d "$proj_dir" ]] || continue
@@ -149,56 +202,18 @@ cmd_gaps() {
         missing_ci+=("$proj")
       fi
     fi
-  done
 
-  # Production readiness checks — only for projects with CI (they're production-bound)
-  local missing_release=()
-  local missing_health=()
-  local missing_deploy=()
-  local missing_backup=()
-  local missing_errortracking=()
-  local missing_envtemplate=()
-
-  for proj_dir in "$PROJECTS_DIR"/*/; do
-    [[ -d "$proj_dir" ]] || continue
-    proj=$(basename "$proj_dir")
-
-    # Only check projects that have CI
-    local has_ci=false
-    [[ -d "$proj_dir/.github/workflows" ]] && has_ci=true
-    [[ -f "$proj_dir/.gitlab-ci.yml" ]] && has_ci=true
-    $has_ci || continue
-
-    # Release module (Elixir-specific) — check root and server/ for monorepos
-    if [[ -f "$proj_dir/mix.exs" ]] || [[ -f "$proj_dir/server/mix.exs" ]]; then
-      if ! grep -rq "Release" "$proj_dir"/lib/*/release.ex "$proj_dir"/server/lib/*/release.ex 2>/dev/null; then
-        missing_release+=("$proj")
+    # Design system check (only for UI projects)
+    if [[ -d "$proj_dir/assets" ]] || [[ -d "$proj_dir/src" ]]; then
+      if [[ ! -d "$proj_dir/assets/vendor/graybeam-ui" ]]; then
+        missing_design+=("$proj")
       fi
     fi
 
-    # Health endpoint — check lib/, server/lib/, src/ for monorepos
-    if ! grep -rq '/health\|/api/health' "$proj_dir/lib/" "$proj_dir/server/lib/" "$proj_dir/src/" 2>/dev/null; then
-      missing_health+=("$proj")
-    fi
-
-    # Deploy scripts
-    if [[ ! -d "$proj_dir/deploy" ]] && [[ ! -f "$proj_dir/graybeam.toml" ]]; then
-      missing_deploy+=("$proj")
-    fi
-
-    # Backup script
-    if [[ ! -f "$proj_dir/deploy/backup.sh" ]] && ! grep -q "backup" "$proj_dir/graybeam.toml" 2>/dev/null; then
-      missing_backup+=("$proj")
-    fi
-
-    # Error tracking — check root and subdirs for monorepos
-    if ! grep -rq 'sentry\|Sentry\|rollbar\|bugsnag' "$proj_dir/mix.exs" "$proj_dir/server/mix.exs" "$proj_dir/package.json" "$proj_dir/frontend/package.json" "$proj_dir/Cargo.toml" 2>/dev/null; then
-      missing_errortracking+=("$proj")
-    fi
-
-    # Env template
-    if [[ ! -f "$proj_dir/.env.example" ]] && [[ ! -f "$proj_dir/deploy/provision.sh" ]]; then
-      missing_envtemplate+=("$proj")
+    # Hook shadow check (project settings defining hooks that override global)
+    local proj_settings="$proj_dir/.claude/settings.json"
+    if [[ -f "$proj_settings" ]] && grep -q '"hooks"' "$proj_settings" 2>/dev/null; then
+      hook_shadows+=("$proj")
     fi
   done
 
@@ -239,55 +254,59 @@ cmd_gaps() {
     printf "\n"
   fi
 
-  # Production readiness report (only if any CI projects exist)
-  local prod_gaps=$(( ${#missing_release[@]} + ${#missing_health[@]} + ${#missing_deploy[@]} + ${#missing_backup[@]} + ${#missing_errortracking[@]} + ${#missing_envtemplate[@]} ))
-  if (( prod_gaps > 0 )); then
-    section "Production Readiness (projects with CI)"
+  if (( ${#missing_design[@]} > 0 )); then
+    printf "  ${Y}No graybeam-ui tokens:${N}\n"
+    for p in "${missing_design[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+    printf "\n"
+  fi
 
-    if (( ${#missing_release[@]} > 0 )); then
-      printf "  ${Y}Elixir without Release module:${N}\n"
-      for p in "${missing_release[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
+  if (( ${#hook_shadows[@]} > 0 )); then
+    printf "  ${D}Projects with local hooks (additive to global — not a gap):${N}\n"
+    for p in "${hook_shadows[@]}"; do printf "    ${D}ℹ${N} %s\n" "$p"; done
+    printf "\n"
+  fi
+
+  # Global hook health check
+  local hook_issues=0
+  if [[ -f "$HOME/.claude/settings.json" ]]; then
+    local missing_scripts
+    missing_scripts=$(python3 -c "
+import json, os
+try:
+    data = json.load(open('$HOME/.claude/settings.json'))
+    hooks = data.get('hooks', {})
+    missing = []
+    for event, matchers in hooks.items():
+        for m in matchers:
+            for h in m.get('hooks', []):
+                cmd = h.get('command', '')
+                if cmd and not os.path.isfile(cmd):
+                    missing.append(os.path.basename(cmd))
+                elif cmd and not os.access(cmd, os.X_OK):
+                    missing.append(os.path.basename(cmd) + ' (not executable)')
+    for m in missing:
+        print(m)
+except: pass
+" 2>/dev/null)
+    if [[ -n "$missing_scripts" ]]; then
+      printf "  ${R}Broken global hooks:${N}\n"
+      while IFS= read -r script; do
+        printf "    ${R}●${N} %s\n" "$script"
+        hook_issues=$((hook_issues + 1))
+      done <<< "$missing_scripts"
       printf "\n"
     fi
-
-    if (( ${#missing_health[@]} > 0 )); then
-      printf "  ${Y}No health endpoint:${N}\n"
-      for p in "${missing_health[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
-      printf "\n"
-    fi
-
-    if (( ${#missing_deploy[@]} > 0 )); then
-      printf "  ${Y}No deploy scripts:${N}\n"
-      for p in "${missing_deploy[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
-      printf "\n"
-    fi
-
-    if (( ${#missing_backup[@]} > 0 )); then
-      printf "  ${Y}No backup script:${N}\n"
-      for p in "${missing_backup[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
-      printf "\n"
-    fi
-
-    if (( ${#missing_errortracking[@]} > 0 )); then
-      printf "  ${Y}No error tracking:${N}\n"
-      for p in "${missing_errortracking[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
-      printf "\n"
-    fi
-
-    if (( ${#missing_envtemplate[@]} > 0 )); then
-      printf "  ${Y}No .env template:${N}\n"
-      for p in "${missing_envtemplate[@]}"; do printf "    ${R}●${N} %s\n" "$p"; done
-      printf "\n"
-    fi
+  else
+    printf "  ${R}No global Claude settings (~/.claude/settings.json missing)${N}\n"
+    hook_issues=1
   fi
 
   # Summary
-  local total_gaps=$(( ${#missing_claude[@]} + ${#missing_hook[@]} + ${#missing_credo[@]} + ${#missing_precommit[@]} + ${#missing_ci[@]} + prod_gaps ))
+  local total_gaps=$(( ${#missing_claude[@]} + ${#missing_hook[@]} + ${#missing_credo[@]} + ${#missing_precommit[@]} + ${#missing_ci[@]} + ${#missing_design[@]} + hook_issues ))
   if (( total_gaps == 0 )); then
-    printf "  ${G}All projects have full quality and production infrastructure.${N}\n"
+    printf "  ${G}All projects have full quality infrastructure.${N}\n"
   else
-    local dev_gaps=$(( ${#missing_claude[@]} + ${#missing_hook[@]} + ${#missing_credo[@]} + ${#missing_precommit[@]} + ${#missing_ci[@]} ))
-    printf "  ${D}Dev quality gaps: %d | Production readiness gaps: %d${N}\n" "$dev_gaps" "$prod_gaps"
+    printf "  ${D}Total gaps: %d across all categories${N}\n" "$total_gaps"
     printf "  ${D}Fix with: trimtab init <project>${N}\n"
   fi
 }
@@ -297,6 +316,7 @@ cmd_gaps() {
 # ============================================================
 cmd_sync() {
   local use_ai=false
+  shift 2>/dev/null || true
   for arg in "$@"; do
     [[ "$arg" == "--ai" ]] && use_ai=true
   done
@@ -339,11 +359,11 @@ ${extracted}
   section "Memory File Lessons"
   local memory_lessons=""
 
-  for memory_dir in "$HOME/.claude/projects/-${CHEZMOI_PREFIX}-"*/memory/; do
+  for memory_dir in "$HOME/.claude/projects/-home-mchughson-1-Projects-"*/memory/; do
     [[ -d "$memory_dir" ]] || continue
     local proj
     proj=$(basename "$(dirname "$memory_dir")")
-    proj="${proj#-${CHEZMOI_PREFIX}-}"
+    proj="${proj#-home-mchughson-1-Projects-}"
 
     for md_file in "$memory_dir"*.md; do
       [[ -f "$md_file" ]] || continue
@@ -416,8 +436,13 @@ ${extracted}
   printf "  ${D}Analyzing %d lessons across %d projects...${N}\n" "$lesson_count" "$project_count"
 
   # Find API key
-  local api_key
-  api_key=$(_find_openrouter_key)
+  local api_key=""
+  for env_file in "$PROJECTS_DIR/decision_forge_v2/.env" "$PROJECTS_DIR/ai-brand-studio/.env" "$HOME/.env"; do
+    if [[ -f "$env_file" ]]; then
+      api_key=$(grep "^OPENROUTER_API_KEY=" "$env_file" 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+      [[ -n "$api_key" ]] && break
+    fi
+  done
 
   if [[ -z "$api_key" ]]; then
     printf "  ${R}No OPENROUTER_API_KEY found${N}\n"
@@ -498,252 +523,146 @@ except Exception as e:
 }
 
 # ============================================================
-# UX — audit LiveView UX anti-patterns across projects
+# TYPOGRAPHY — scan for typography quality issues
 # ============================================================
-cmd_ux() {
-  local filter_project="${1:-}"
-
-  section "UX Pattern Audit (LiveView Projects)"
+cmd_typography() {
+  section "Typography Audit"
+  printf "  ${D}Scanning CSS + components across all projects...${N}\n\n"
 
   local total_issues=0
-  local projects_scanned=0
 
   for proj_dir in "$PROJECTS_DIR"/*/; do
     [[ -d "$proj_dir" ]] || continue
     local proj
     proj=$(basename "$proj_dir")
 
-    # If filtering to a single project, skip others
-    if [[ -n "$filter_project" ]] && [[ "$proj" != "$filter_project" ]]; then
-      continue
+    # Only scan projects with CSS or component files
+    local has_css=false
+    [[ -d "$proj_dir/assets/css" ]] && has_css=true
+    [[ -d "$proj_dir/lib" ]] && has_css=true
+    [[ -d "$proj_dir/src" ]] && has_css=true
+    $has_css || continue
+
+    local issues=()
+    local issue_count=0
+
+    # ── 1. Arbitrary pixel font sizes in CSS ──
+    local px_sizes=()
+    if [[ -d "$proj_dir/assets/css" ]]; then
+      while IFS= read -r match; do
+        [[ -n "$match" ]] && px_sizes+=("$match")
+      done < <(grep -rhoP 'font-size:\s*\K\d+px' "$proj_dir/assets/css/" 2>/dev/null | sort -u || true)
     fi
 
-    # Only LiveView projects
-    [[ -f "$proj_dir/mix.exs" ]] || continue
-    grep -q "phoenix_live_view\|phoenix_html" "$proj_dir/mix.exs" 2>/dev/null || continue
-
-    projects_scanned=$((projects_scanned + 1))
-    local proj_issues=()
-
-    # Find .heex files, excluding deps/_build/_archive/error_html
-    local heex_files=()
-    while IFS= read -r -d '' f; do
-      heex_files+=("$f")
-    done < <(find "$proj_dir/lib" -name "*.heex" \
-      -not -path "*/deps/*" \
-      -not -path "*/_build/*" \
-      -not -path "*/_archive/*" \
-      -not -path "*/error_html/*" \
-      -print0 2>/dev/null)
-
-    # Check 1: Raw <a href= (should be <.link navigate=)
-    local raw_links=()
-    for file in "${heex_files[@]}"; do
-      local matches
-      matches=$(grep -n '<a[[:space:]]\+href=' "$file" 2>/dev/null \
-        | grep -v 'href="https\?://' \
-        | grep -v 'href="#' || true)
-      if [[ -n "$matches" ]]; then
-        while IFS= read -r line; do
-          local relpath="${file#"$proj_dir"}"
-          local lineno="${line%%:*}"
-          raw_links+=("${relpath}:${lineno}")
-        done <<< "$matches"
-      fi
+    # Also check for arbitrary Tailwind text-[Npx] in templates
+    local tw_arbitrary=()
+    for search_dir in "$proj_dir/lib" "$proj_dir/src"; do
+      [[ -d "$search_dir" ]] || continue
+      while IFS= read -r match; do
+        [[ -n "$match" ]] && tw_arbitrary+=("$match")
+      done < <(grep -rhoP 'text-\[\d+px\]' "$search_dir/" 2>/dev/null | sort -u || true)
     done
 
-    if (( ${#raw_links[@]} > 0 )); then
-      proj_issues+=("RAW_LINKS")
+    if (( ${#px_sizes[@]} > 0 )) || (( ${#tw_arbitrary[@]} > 0 )); then
+      local all_px="${px_sizes[*]} ${tw_arbitrary[*]}"
+      all_px=$(echo "$all_px" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+      issues+=("${R}●${N} Arbitrary pixel sizes: ${Y}${all_px}${N}")
+      issue_count=$((issue_count + 1))
     fi
 
-    # Check 2: <button type="submit"> without phx-disable-with
-    local no_disable=()
-    for file in "${heex_files[@]}"; do
-      local matches
-      matches=$(grep -n 'type="submit"' "$file" 2>/dev/null \
-        | grep -v 'phx-disable-with' || true)
-      if [[ -n "$matches" ]]; then
-        while IFS= read -r line; do
-          local relpath="${file#"$proj_dir"}"
-          local lineno="${line%%:*}"
-          no_disable+=("${relpath}:${lineno}")
-        done <<< "$matches"
-      fi
-    done
-
-    if (( ${#no_disable[@]} > 0 )); then
-      proj_issues+=("NO_DISABLE_WITH")
+    # ── 2. Count distinct font-size values (too many = no scale) ──
+    local distinct_sizes=0
+    if [[ -d "$proj_dir/assets/css" ]]; then
+      distinct_sizes=$(grep -rhoP 'font-size:\s*\K[^;]+' "$proj_dir/assets/css/" 2>/dev/null | sed 's/\s*!important//' | sort -u | wc -l || true)
+    fi
+    if (( distinct_sizes > 6 )); then
+      issues+=("${R}●${N} Too many distinct sizes: ${Y}${distinct_sizes}${N} (>6 suggests no type scale)")
+      issue_count=$((issue_count + 1))
     fi
 
-    # Check 3: Uses phx-click but missing CSS loading variants
-    local has_phx_click=false
-    local has_loading_css=false
-    for file in "${heex_files[@]}"; do
-      if grep -q 'phx-click=' "$file" 2>/dev/null; then
-        has_phx_click=true
+    # ── 3. Missing responsive text ──
+    local has_responsive=false
+    # Check for Tailwind responsive text classes in templates
+    for search_dir in "$proj_dir/lib" "$proj_dir/src"; do
+      [[ -d "$search_dir" ]] || continue
+      if grep -rqP '(sm|md|lg):text-' "$search_dir/" 2>/dev/null; then
+        has_responsive=true
         break
       fi
     done
+    # Check for @media with font-size in CSS
+    if ! $has_responsive && [[ -d "$proj_dir/assets/css" ]]; then
+      if grep -rqP '@media.*\{[^}]*font-size' "$proj_dir/assets/css/" 2>/dev/null; then
+        has_responsive=true
+      fi
+      # Check for responsive CSS var like --phi-base
+      if grep -rqP '--.*base.*:.*@media|@media.*--.*base' "$proj_dir/assets/css/" 2>/dev/null; then
+        has_responsive=true
+      fi
+      # Check for @container or responsive type tokens
+      if grep -rqP 'font-size:.*clamp\(' "$proj_dir/assets/css/" 2>/dev/null; then
+        has_responsive=true
+      fi
+    fi
+    if ! $has_responsive; then
+      issues+=("${Y}●${N} No responsive text scaling detected")
+      issue_count=$((issue_count + 1))
+    fi
 
-    if $has_phx_click; then
-      local css_file="$proj_dir/assets/css/app.css"
-      if [[ -f "$css_file" ]]; then
-        if grep -q 'phx-click-loading\|@custom-variant' "$css_file" 2>/dev/null; then
-          has_loading_css=true
+    # ── 4. No :root type scale vars ──
+    local has_type_scale=false
+    if [[ -d "$proj_dir/assets" ]]; then
+      # Look for type scale CSS variables (phi, text, font, type, step)
+      if grep -rqP ':root\s*\{[^}]*(--phi|--text-|--font-size-|--type-|--step-)' "$proj_dir/assets/" 2>/dev/null; then
+        has_type_scale=true
+      fi
+      # Also check vendor dir (graybeam-ui provides the scale)
+      if [[ -d "$proj_dir/assets/vendor/graybeam-ui" ]]; then
+        if grep -rqP '(--phi|--text-|--font-size-|--type-|--step-)' "$proj_dir/assets/vendor/graybeam-ui/" 2>/dev/null; then
+          has_type_scale=true
         fi
       fi
     fi
-
-    local missing_loading=false
-    if $has_phx_click && ! $has_loading_css; then
-      missing_loading=true
-      proj_issues+=("MISSING_LOADING_CSS")
+    if ! $has_type_scale; then
+      issues+=("${Y}●${N} No :root type scale variables")
+      issue_count=$((issue_count + 1))
     fi
 
-    # Check 4: phx-change on bare <input>/<select>/<textarea> outside a <form>
-    local bare_phx_change=()
-    for file in "${heex_files[@]}"; do
-      local matches
-      matches=$(grep -n 'phx-change=' "$file" 2>/dev/null || true)
-      [[ -z "$matches" ]] && continue
-      while IFS= read -r line; do
-        # Skip if the line contains <form (it's on the form itself)
-        echo "$line" | grep -q '<form' && continue
-        # Flag input/select/textarea with phx-change
-        if echo "$line" | grep -qE '<(input|select|textarea)[[:space:]]' 2>/dev/null; then
-          local relpath="${file#"$proj_dir"}"
-          local lineno="${line%%:*}"
-          bare_phx_change+=("${relpath}:${lineno}")
-        fi
-      done <<< "$matches"
-    done
-
-    if (( ${#bare_phx_change[@]} > 0 )); then
-      proj_issues+=("BARE_PHX_CHANGE")
+    # ── 5. Body text < 16px ──
+    local body_size=""
+    if [[ -d "$proj_dir/assets/css" ]]; then
+      # Check for body { font-size: Npx } or html { font-size: Npx }
+      body_size=$(grep -rhoP '(?:body|html)\s*\{[^}]*font-size:\s*\K\d+' "$proj_dir/assets/css/" 2>/dev/null | head -1 || true)
+      # Also check :root font-size
+      if [[ -z "$body_size" ]]; then
+        body_size=$(grep -rhoP ':root\s*\{[^}]*font-size:\s*\K\d+' "$proj_dir/assets/css/" 2>/dev/null | head -1 || true)
+      fi
+    fi
+    if [[ -n "$body_size" ]] && (( body_size < 16 )); then
+      issues+=("${R}●${N} Body text undersized: ${Y}${body_size}px${N} (< 16px)")
+      issue_count=$((issue_count + 1))
     fi
 
-    # Check 5: :utc_datetime without _usec in migrations
-    local bad_datetime=()
-    while IFS= read -r -d '' migfile; do
-      local matches
-      matches=$(grep -n ':utc_datetime' "$migfile" 2>/dev/null | grep -v '_usec' || true)
-      if [[ -n "$matches" ]]; then
-        while IFS= read -r line; do
-          local relpath="${migfile#"$proj_dir"}"
-          local lineno="${line%%:*}"
-          bad_datetime+=("${relpath}:${lineno}")
-        done <<< "$matches"
-      fi
-    done < <(find "$proj_dir" -path "*/migrations/*.exs" -not -path "*/deps/*" -not -path "*/_build/*" -print0 2>/dev/null)
-
-    if (( ${#bad_datetime[@]} > 0 )); then
-      proj_issues+=("UTC_DATETIME")
-    fi
-
-    # Check 6: <textarea value= (browsers ignore it)
-    local textarea_value=()
-    for file in "${heex_files[@]}"; do
-      local matches
-      matches=$(grep -n '<textarea[[:space:]].*value=' "$file" 2>/dev/null || true)
-      if [[ -n "$matches" ]]; then
-        while IFS= read -r line; do
-          local relpath="${file#"$proj_dir"}"
-          local lineno="${line%%:*}"
-          textarea_value+=("${relpath}:${lineno}")
-        done <<< "$matches"
-      fi
-    done
-
-    if (( ${#textarea_value[@]} > 0 )); then
-      proj_issues+=("TEXTAREA_VALUE")
-    fi
-
-    # Check 7: Missing catch-all handle_event
-    local missing_catchall=()
-    local ex_files=()
-    while IFS= read -r -d '' f; do
-      ex_files+=("$f")
-    done < <(find "$proj_dir/lib" -name "*.ex" -not -path "*/deps/*" -not -path "*/_build/*" -print0 2>/dev/null)
-
-    for file in "${ex_files[@]}"; do
-      # Only check files that define handle_event
-      grep -q 'def handle_event(' "$file" 2>/dev/null || continue
-      # Check if a catch-all exists (matches any event name with _ or variable)
-      if ! grep -qE 'def handle_event\(\s*(_|[a-z_]+)\s*,\s*(_|_[a-z_]*)\s*,\s*socket\)' "$file" 2>/dev/null; then
-        local relpath="${file#"$proj_dir"}"
-        missing_catchall+=("$relpath")
-      fi
-    done
-
-    if (( ${#missing_catchall[@]} > 0 )); then
-      proj_issues+=("MISSING_CATCHALL")
-    fi
-
-    # Print project results if it has issues
-    if (( ${#proj_issues[@]} > 0 )); then
-      printf "\n  ${B}%s${N}\n" "$proj"
-
-      if (( ${#raw_links[@]} > 0 )); then
-        printf "    ${Y}●${N} Raw <a href=...> — use <.link navigate=...>\n"
-        for loc in "${raw_links[@]}"; do
-          printf "      ${D}%s${N}\n" "$loc"
-        done
-        total_issues=$((total_issues + ${#raw_links[@]}))
-      fi
-
-      if (( ${#no_disable[@]} > 0 )); then
-        printf "    ${Y}●${N} <button type=\"submit\"> without phx-disable-with\n"
-        for loc in "${no_disable[@]}"; do
-          printf "      ${D}%s${N}\n" "$loc"
-        done
-        total_issues=$((total_issues + ${#no_disable[@]}))
-      fi
-
-      if $missing_loading; then
-        printf "    ${Y}●${N} Uses phx-click but missing CSS @custom-variant for loading states\n"
-        total_issues=$((total_issues + 1))
-      fi
-
-      if (( ${#bare_phx_change[@]} > 0 )); then
-        printf "    ${Y}●${N} phx-change on bare <input> outside <form>\n"
-        for loc in "${bare_phx_change[@]}"; do
-          printf "      ${D}%s${N}\n" "$loc"
-        done
-        total_issues=$((total_issues + ${#bare_phx_change[@]}))
-      fi
-
-      if (( ${#bad_datetime[@]} > 0 )); then
-        printf "    ${Y}●${N} :utc_datetime without _usec in migration\n"
-        for loc in "${bad_datetime[@]}"; do
-          printf "      ${D}%s${N}\n" "$loc"
-        done
-        total_issues=$((total_issues + ${#bad_datetime[@]}))
-      fi
-
-      if (( ${#textarea_value[@]} > 0 )); then
-        printf "    ${Y}●${N} <textarea value=...> — browsers ignore value attr on textarea\n"
-        for loc in "${textarea_value[@]}"; do
-          printf "      ${D}%s${N}\n" "$loc"
-        done
-        total_issues=$((total_issues + ${#textarea_value[@]}))
-      fi
-
-      if (( ${#missing_catchall[@]} > 0 )); then
-        printf "    ${Y}●${N} handle_event without catch-all clause (crash loop risk)\n"
-        for loc in "${missing_catchall[@]}"; do
-          printf "      ${D}%s${N}\n" "$loc"
-        done
-        total_issues=$((total_issues + ${#missing_catchall[@]}))
-      fi
+    # ── Report for this project ──
+    if (( issue_count > 0 )); then
+      printf "  ${B}%-24s${N} ${R}%d issue(s)${N}\n" "$proj" "$issue_count"
+      for issue in "${issues[@]}"; do
+        printf "    %b\n" "$issue"
+      done
+      printf "\n"
+      total_issues=$((total_issues + issue_count))
+    else
+      printf "  ${B}%-24s${N} ${G}clean${N}\n" "$proj"
     fi
   done
 
-  # Summary
+  # ── Summary ──
   section "Summary"
-  printf "  ${D}Projects scanned: %d | Issues: %d${N}\n" "$projects_scanned" "$total_issues"
-
   if (( total_issues == 0 )); then
-    printf "  ${G}No UX anti-patterns found.${N}\n"
+    printf "  ${G}All projects pass typography audit.${N}\n"
+  else
+    printf "  ${Y}%d total issue(s) across projects.${N}\n" "$total_issues"
+    printf "  ${D}Fix with: /phi-type (per project)${N}\n"
   fi
 }
 
@@ -751,19 +670,19 @@ cmd_ux() {
 # DISPATCH
 # ============================================================
 case "$CMD" in
-  audit)  cmd_audit ;;
-  gaps)   cmd_gaps ;;
-  sync)   cmd_sync "$@" ;;
-  ux)     cmd_ux "$@" ;;
+  audit)      cmd_audit ;;
+  gaps)       cmd_gaps ;;
+  sync)       cmd_sync "$@" ;;
+  typography) cmd_typography ;;
   *)
     echo "trimtab steer — manage trim tab infrastructure"
     echo ""
     echo "Usage: trimtab steer [command]"
     echo ""
     echo "Commands:"
-    echo "  audit    Show trim tab infrastructure across all projects (default)"
-    echo "  gaps     Show projects missing key infrastructure"
-    echo "  sync     Extract and propagate lessons across projects (--ai for analysis)"
-    echo "  ux       Audit LiveView UX anti-patterns (raw links, missing disable-with, etc.)"
+    echo "  audit       Show trim tab infrastructure across all projects (default)"
+    echo "  gaps        Show projects missing key infrastructure"
+    echo "  sync        Extract and propagate lessons across projects (--ai for analysis)"
+    echo "  typography  Scan for typography quality issues across all projects"
     ;;
 esac
